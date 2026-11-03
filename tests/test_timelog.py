@@ -192,6 +192,7 @@ class SourcesTest(unittest.TestCase):
             self.assertEqual(src.load_activity(DAY - datetime.timedelta(days=1), Path(tmp)), [])
 
     def test_parse_meetings(self):
+        midnight, half_hour = src.day_bounds(DAY)[1], datetime.timedelta(minutes=30)
         raw = [
             {"subject": "Standup", "start": "2026-10-28T11:00:00+05:30", "end": "2026-10-28T11:30:00+05:30",
              "show_as": "tentative", "all_day": False, "cancelled": False},
@@ -201,7 +202,8 @@ class SourcesTest(unittest.TestCase):
              "show_as": "busy", "all_day": True, "cancelled": False},
             {"subject": "Cancelled", "start": "2026-10-28T15:00:00+05:30", "end": "2026-10-28T16:00:00+05:30",
              "show_as": "busy", "all_day": False, "cancelled": True},
-            {"subject": "Late", "start": "2026-10-28T23:30:00+05:30", "end": "2026-10-29T00:30:00+05:30",
+            # 23:30–00:30 around this machine's midnight (Windows has no tzset, so the TZ pin doesn't apply there)
+            {"subject": "Late", "start": (midnight - half_hour).isoformat(), "end": (midnight + half_hour).isoformat(),
              "show_as": "busy", "all_day": False, "cancelled": False},
         ]
         got = src.parse_meetings(raw, DAY)
