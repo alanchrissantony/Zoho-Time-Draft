@@ -21,7 +21,15 @@ jobs:
           git config --global user.email ci@example.com
           git config --global user.name CI
       - name: Unit tests
-        run: uv run --python ${{ matrix.python }} --group dev python -m unittest discover -v tests
+        shell: bash
+        run: |
+          set +e
+          uv run --python ${{ matrix.python }} --group dev python -m unittest discover -v tests > test-output.txt 2>&1
+          status=$?
+          cat test-output.txt
+          # Failures as annotations: readable on the run page without logging in
+          [ $status -eq 0 ] || uv run --no-project python tests/gh_annotate.py test-output.txt
+          exit $status
 
   install:
     # A teammate's path: install the tool, `timelog install`, a prompt through the hook, uninstall

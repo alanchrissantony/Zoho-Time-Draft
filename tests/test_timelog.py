@@ -604,7 +604,8 @@ class SchedulerTest(unittest.TestCase):
         for line in ("OnCalendar=*-*-* 10,15:00:00", "Persistent=true", "OnStartupSec=1min", "WantedBy=timers.target"):
             self.assertIn(line, timer)
         app = units["timelog-app.service"]
-        self.assertIn(f'ExecStart="/home/a b/.local/bin/timelog" "--log" "{scheduler.LOGS["app"]}" "app"', app)
+        log = scheduler._sd_quote(str(scheduler.LOGS["app"]))   # a Windows path's backslashes get doubled
+        self.assertIn(f'ExecStart="/home/a b/.local/bin/timelog" "--log" {log} "app"', app)
         self.assertIn('Environment="PATH=/x/bin:/usr/bin"', app)
         self.assertIn("Restart=always", app)
         self.assertIn("Type=oneshot", units["timelog-draft.service"])
