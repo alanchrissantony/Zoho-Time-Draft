@@ -25,12 +25,21 @@ PROMPT = "ci → ✓ café"
 GIT_BASH = Path(r"C:\Program Files\Git\bin\bash.exe")
 
 failures: list[str] = []
+GITHUB = os.getenv("GITHUB_ACTIONS") == "true"
+
+
+def annotate(level: str, title: str, text: str) -> None:
+    """On GitHub, also show it on the run page (readable without logging in, unlike the log)."""
+    if GITHUB:
+        body = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::{level} title=smoke {sys.platform}: {title}::{body}", flush=True)
 
 
 def check(ok: bool, what: str) -> bool:
     print(("PASS " if ok else "FAIL ") + what, flush=True)
     if not ok:
         failures.append(what)
+        annotate("error", "FAIL", what)
     return ok
 
 
@@ -110,6 +119,10 @@ def main() -> int:
     check(bool(shutil.which("timelog")), f"timelog on PATH: {shutil.which('timelog')}")
 
     print("\n== install")
+    if MAC:   # launchd agents live in the GUI session; note whether this machine has one
+        gui = run(["launchctl", "print", f"gui/{os.getuid()}"])
+        note(f"GUI session gui/{os.getuid()}: {'present' if gui.returncode == 0 else 'missing'}")
+        annotate("notice", "GUI session", f"gui/{os.getuid()} {'present' if gui.returncode == 0 else 'missing'}")
     installed = run(["timelog", "install"])
     jobs = jobs_present()
     if WINDOWS:   # proves Task Scheduler accepted the generated XML for a non-admin task
@@ -145,6 +158,9 @@ def main() -> int:
     check(not any(jobs_present().values()), "scheduled jobs removed")
 
     print(f"\n{len(failures)} failure(s)" + "".join(f"\n  - {f}" for f in failures))
+    if failures:
+        annotate("error", f"timelog install exited {installed.returncode}",
+                 (installed.stdout + installed.stderr)[-2500:])
     return 1 if failures else 0
 
 
