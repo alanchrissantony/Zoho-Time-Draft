@@ -8,15 +8,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import drafts as dr
-import sources as src
-import zoho_api as zoho
+from zoho_timelog import cli
+from zoho_timelog import drafts as dr
+from zoho_timelog import hook, oscompat, scheduler
+from zoho_timelog import sources as src
+from zoho_timelog import zoho_api as zoho
 
 DAY = datetime.date(2026, 10, 28)  # a Wednesday
 TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 os.environ["TZ"] = "Asia/Kolkata"  # day_bounds uses local time; keep tests stable on any machine
 if hasattr(__import__("time"), "tzset"):
     __import__("time").tzset()
+# Fake Zoho credentials, so no test ever uses (or needs) a real .env or Connect Zoho file
+os.environ.update(ZOHO_CLIENT_ID="env-id", ZOHO_CLIENT_SECRET="env-secret", ZOHO_REFRESH_TOKEN="env-refresh",
+                  ZOHO_USER="env@example.com")
 
 
 def at(hhmm: str) -> datetime.datetime:
@@ -207,8 +212,8 @@ class SourcesTest(unittest.TestCase):
         """outlook_meetings(DAY) with run_claude returning or raising each reply in turn."""
         from unittest import mock
         with mock.patch.dict(os.environ, {"TIMELOG_MEETINGS": "1"}), \
-                mock.patch("sources.other_mcp_servers", return_value=["mcp__claude_ai_Figma"]), \
-                mock.patch("sources.run_claude", side_effect=replies) as run:
+                mock.patch("zoho_timelog.sources.other_mcp_servers", return_value=["mcp__claude_ai_Figma"]), \
+                mock.patch("zoho_timelog.sources.run_claude", side_effect=replies) as run:
             result = src.outlook_meetings(DAY)
         leave_out = run.call_args.kwargs["disallowed_tools"]
         self.assertIn("mcp__claude_ai_Figma", leave_out)
@@ -234,7 +239,8 @@ class SourcesTest(unittest.TestCase):
     def test_run_claude_disallowed_tools(self):
         from unittest import mock
         done = mock.Mock(returncode=0, stdout=json.dumps({"structured_output": {"ok": 1}}), stderr="")
-        with mock.patch("sources.subprocess.run", return_value=done) as run:
+        with mock.patch("zoho_timelog.sources.claude_cmd", return_value=["claude"]), \
+                mock.patch("zoho_timelog.oscompat.subprocess.run", return_value=done) as run:
             src.run_claude("hi", {}, allowed_tools="t1", disallowed_tools=["mcp__a", "mcp__b"])
             cmd = run.call_args.args[0]
             self.assertEqual(cmd[cmd.index("--disallowedTools"):], ["--disallowedTools", "mcp__a", "mcp__b"])
@@ -288,16 +294,148 @@ class InjectedPromptsTest(unittest.TestCase):
         self.assertEqual(src.clean_prompt("make <b> bold"), "make <b> bold")
 
     def test_hook_records_only_what_you_typed(self):
-        import subprocess
-        hook = Path(__file__).resolve().parent.parent / "hooks" / "timelog.sh"
         with tempfile.TemporaryDirectory() as tmp:
             for prompt in ("<ide_opened_file>x</ide_opened_file>\nwould this run", "<task-notification>done",
                            "<ide_selection>only context</ide_selection>"):
-                proc = subprocess.run(["bash", str(hook)], input=json.dumps({"cwd": tmp, "prompt": prompt}),
-                                      capture_output=True, text=True, env={**os.environ, "TIMELOG_DIR": tmp})
-                self.assertEqual((proc.returncode, proc.stdout), (0, ""))
-            lines = [json.loads(l) for f in Path(tmp).glob("*.jsonl") for l in f.read_text().splitlines()]
-            self.assertEqual([l["prompt"] for l in lines], ["would this run"])
+                proc = run_hook({"cwd": tmp, "prompt": prompt}, tmp)
+                self.assertEqual((proc.returncode, proc.stdout), (0, b""))
+            self.assertEqual([l["prompt"] for l in jsonl_lines(tmp)], ["would this run"])
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def run_hook(event, timelog_dir: str, **env):
+    """`python -m zoho_timelog hook` as Claude Code runs it: the event as JSON (or raw bytes) on stdin."""
+    import subprocess
+    data = event if isinstance(event, bytes) else json.dumps(event).encode()
+    return subprocess.run([sys.executable, "-m", "zoho_timelog", "hook"], input=data, capture_output=True,
+                          cwd=ROOT, env={**os.environ, "TIMELOG_DIR": timelog_dir, **env})
+
+
+def jsonl_lines(timelog_dir: str) -> list[dict]:
+    return [json.loads(l) for f in Path(timelog_dir).glob("*.jsonl")
+            for l in f.read_text(encoding="utf-8").splitlines()]
+
+
+class HookTest(unittest.TestCase):
+    def git_repo(self, parent: str, remote: str) -> Path:
+        import subprocess
+        repo = Path(parent, "kawada-api")
+        sub = repo / "src"
+        sub.mkdir(parents=True)
+        for args in (["init", "-q", "-b", "feat/x"], ["remote", "add", "origin", remote]):
+            subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+        return sub
+
+    def test_fields_in_a_git_repo(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as logs:
+            cwd = self.git_repo(tmp, "ssh://git@gitlab.codemonk.io:2224/codemonk/kawada/kawada-api.git")
+            proc = run_hook({"cwd": str(cwd), "prompt": "fix the café → menü bug " + "x" * 300,
+                             "session_id": "s1"}, logs)
+            self.assertEqual((proc.returncode, proc.stdout, proc.stderr), (0, b"", b""))
+            [line] = jsonl_lines(logs)
+        self.assertEqual(Path(line["repo_path"]).resolve(), cwd.parent.resolve())
+        self.assertEqual((line["repo"], line["remote_group"], line["branch"], line["cwd"], line["session_id"]),
+                         ("kawada-api", "codemonk/kawada", "feat/x", str(cwd), "s1"))
+        self.assertTrue(line["prompt"].startswith("fix the café → menü bug"))
+        self.assertEqual(len(line["prompt"]), 200)
+        self.assertIsNotNone(datetime.datetime.fromisoformat(line["ts"]).tzinfo)
+
+    def test_outside_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as logs:
+            run_hook({"cwd": tmp, "prompt": "hello"}, logs)
+            [line] = jsonl_lines(logs)
+        self.assertEqual((line["repo"], line["repo_path"], line["remote_group"], line["branch"]),
+                         (Path(tmp).name, tmp, "", ""))
+
+    def test_writes_nothing_and_never_fails(self):
+        with tempfile.TemporaryDirectory() as logs:
+            for event, env in ((b"not json{", {}), (b"", {}), (b"[1, 2]", {}),
+                               ({"cwd": logs, "prompt": "mine"}, {"TIMELOG_DISABLE": "1"}),
+                               ({"cwd": logs, "prompt": "<system-reminder>x"}, {})):
+                proc = run_hook(event, logs, **env)
+                self.assertEqual((proc.returncode, proc.stdout, proc.stderr), (0, b"", b""), event)
+            self.assertEqual(jsonl_lines(logs), [])
+
+    def test_remote_group(self):
+        cases = {
+            "ssh://git@gitlab.codemonk.io:2224/codemonk/kawada/x.git": "codemonk/kawada",
+            "git@github.com:org/sub/repo.git": "org/sub",
+            "https://gitlab.com/a/b/c.git": "a/b",
+            "https://github.com/me/repo/": "me",
+            "git@github.com:repo.git": "",
+            "": "",
+        }
+        for url, group in cases.items():
+            self.assertEqual(hook.remote_group(url), group, url)
+
+    def test_same_dir_as_constants_and_imports_stay_light(self):
+        import subprocess
+        from zoho_timelog import constants
+        self.assertEqual(hook.TIMELOG_DIR, constants.TIMELOG_DIR)
+        heavy = ("dotenv", "requests", "starlette", "uvicorn", "zoho_timelog.constants", "zoho_timelog.drafts")
+        check = ("import sys, zoho_timelog.hook; "
+                 f"print([m for m in {heavy!r} if m in sys.modules])")
+        out = subprocess.run([sys.executable, "-c", check], capture_output=True, text=True, cwd=ROOT).stdout
+        self.assertEqual(out.strip(), "[]")
+
+
+class HookSettingsTest(unittest.TestCase):
+    OTHER = {"type": "command", "command": "/usr/local/bin/other-tool notify"}
+
+    def test_replaces_old_entry_and_keeps_others(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "settings.json")
+            path.write_text(json.dumps({"model": "opus", "hooks": {
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/Users/a/.claude/hooks/timelog.sh"},
+                                                self.OTHER]}],
+                "Stop": [{"hooks": [self.OTHER]}]}}))
+            new = '"C:/Users/a/.local/bin/timelog.exe" hook'
+            self.assertTrue(cli.update_hook_settings(path, new))
+            got = json.loads(path.read_text())
+            self.assertEqual(got["hooks"]["UserPromptSubmit"],
+                             [{"hooks": [self.OTHER]}, {"hooks": [{"type": "command", "command": new}]}])
+            self.assertEqual((got["model"], got["hooks"]["Stop"]), ("opus", [{"hooks": [self.OTHER]}]))
+            self.assertIn("timelog.sh", Path(tmp, "settings.json.bak").read_text())
+
+            self.assertFalse(cli.update_hook_settings(path, new))          # second run: nothing to do
+            moved = '"/home/a/.local/bin/timelog" hook'                     # reinstalled elsewhere
+            self.assertTrue(cli.update_hook_settings(path, moved))
+            commands = [h["command"] for g in json.loads(path.read_text())["hooks"]["UserPromptSubmit"]
+                        for h in g["hooks"]]
+            self.assertEqual(commands, [self.OTHER["command"], moved])
+
+            self.assertTrue(cli.update_hook_settings(path, None))          # uninstall
+            self.assertEqual(json.loads(path.read_text())["hooks"]["UserPromptSubmit"], [{"hooks": [self.OTHER]}])
+
+    def test_missing_settings_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, ".claude", "settings.json")
+            self.assertTrue(cli.update_hook_settings(path, '"/x/timelog" hook'))
+            self.assertFalse(Path(tmp, ".claude", "settings.json.bak").exists())
+            self.assertTrue(cli.update_hook_settings(path, None))
+            self.assertEqual(json.loads(path.read_text()), {})
+
+    def test_hook_command_quotes_with_forward_slashes(self):
+        from unittest import mock
+        with mock.patch.object(cli, "IS_WINDOWS", True), \
+                mock.patch.object(cli, "self_command", return_value=[r"C:\Users\a b\.local\bin\timelog.exe"]):
+            self.assertEqual(cli.hook_command(), '"C:/Users/a b/.local/bin/timelog.exe" hook')
+        with mock.patch.object(cli, "self_command", return_value=["/usr/bin/python3", "/src/repo/timelog.py"]):
+            self.assertEqual(cli.hook_command(), '"/usr/bin/python3" "/src/repo/timelog.py" hook')
+
+    @unittest.skipIf(sys.platform == "win32", "the bash hook only ever existed on macOS/Linux")
+    def test_old_hook_forwards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp, "timelog.sh")
+            self.assertFalse(cli.forward_old_hook(old, '"/x/timelog" hook'))   # never installed: left alone
+            old.symlink_to(Path(tmp, "deleted-repo-script.sh"))
+            self.assertTrue(cli.forward_old_hook(old, '"/x/timelog" hook'))
+            self.assertFalse(old.is_symlink())
+            self.assertIn('exec "/x/timelog" hook', old.read_text())
+            self.assertTrue(os.access(old, os.X_OK))
+            self.assertFalse(cli.forward_old_hook(old, '"/x/timelog" hook'))
 
 
 class ZohoHelpersTest(unittest.TestCase):
@@ -319,7 +457,7 @@ class ZohoHelpersTest(unittest.TestCase):
 
         def reply(body):
             return mock.Mock(json=mock.Mock(return_value=body))
-        with mock.patch("zoho_api.requests.post", return_value=reply(
+        with mock.patch("zoho_timelog.zoho_api.requests.post", return_value=reply(
                 {"response": {"status": 0, "result": [{"timeLogId": "77"}]}})) as post:
             res = zoho.add_timelog("j1", DAY, "Did x", "tok", project_id="p1", hours="01:30", label="P | J")
         self.assertEqual((res["success"], res["log_id"]), (True, "77"))
@@ -327,11 +465,329 @@ class ZohoHelpersTest(unittest.TestCase):
         self.assertEqual((sent["hours"], sent["jobId"], sent["projectId"], sent["workDate"]), ("01:30", "j1", "p1", "2026-10-28"))
         self.assertNotIn("fromTime", sent)
 
-        with mock.patch("zoho_api.requests.post", return_value=reply(
+        with mock.patch("zoho_timelog.zoho_api.requests.post", return_value=reply(
                 {"response": {"status": 1, "errors": {"code": 9046, "message": "Overlaps"}}})):
             res = zoho.add_timelog("j1", DAY, "x", "tok", hours="01:00")
         self.assertEqual((res["success"], res["code"]), (False, 9046))
         self.assertIn("Overlaps", res["error"])
+
+
+class OsCompatTest(unittest.TestCase):
+    """What differs between macOS, Windows and Linux; these run on any of them."""
+
+    def test_run_decodes_utf8(self):
+        text = "héllo → ✓ 日本"
+        out = oscompat.run([sys.executable, "-c", f"import sys; sys.stdout.buffer.write({text!r}.encode())"],
+                           capture_output=True, text=True).stdout
+        self.assertEqual(out, text)
+
+    def test_file_lock_excludes_other_processes(self):
+        import subprocess
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            lock, marker = Path(tmp, ".x.lock"), Path(tmp, "got-it")
+            child = (f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})\n"
+                     "from pathlib import Path\nfrom zoho_timelog.oscompat import file_lock\n"
+                     f"with file_lock(Path({str(lock)!r})):\n    Path({str(marker)!r}).write_text('1')\n")
+            with oscompat.file_lock(lock):
+                proc = subprocess.Popen([sys.executable, "-c", child])
+                time.sleep(1)
+                self.assertFalse(marker.exists(), "second process got the lock while it was held")
+            proc.wait(timeout=20)
+            self.assertTrue(marker.exists())
+
+    def test_load_activity_non_ascii(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            line = {"ts": "2026-10-28T10:00:00+0530", "repo": "r", "prompt": "fix the café → menü bug"}
+            Path(tmp, "2026-10-28.jsonl").write_text(json.dumps(line, ensure_ascii=False) + "\n", encoding="utf-8")
+            self.assertEqual(src.load_activity(DAY, Path(tmp))[0]["prompt"], "fix the café → menü bug")
+
+    def test_toast_xml_escapes(self):
+        import xml.etree.ElementTree as ET
+        url = "http://127.0.0.1:8765/#2026-10-28?a=1&b=2"
+        root = ET.fromstring(oscompat.toast_xml("Zoho <log>", 'Missed: "Mon" & Tue', url))
+        self.assertEqual(root.get("launch"), url)
+        self.assertEqual([t.text for t in root.iter("text")], ["Zoho <log>", 'Missed: "Mon" & Tue'])
+
+    def test_notify_per_os(self):
+        from unittest import mock
+        with mock.patch.multiple(oscompat, IS_MAC=False, IS_WINDOWS=True), \
+                mock.patch("zoho_timelog.oscompat.run") as run:
+            oscompat.notify("T", "msg", "http://x/")
+        self.assertEqual(run.call_args.args[0][0], "powershell.exe")
+        self.assertIn('launch="http://x/"', run.call_args.kwargs["env"]["TIMELOG_TOAST"])
+
+        with mock.patch.multiple(oscompat, IS_MAC=False, IS_WINDOWS=False), \
+                mock.patch("zoho_timelog.oscompat.shutil.which", return_value="/usr/bin/notify-send"), \
+                mock.patch("zoho_timelog.oscompat.run") as run:
+            oscompat.notify("T", "msg", "http://x/")
+        self.assertEqual(run.call_args.args[0][0], "notify-send")
+
+        with mock.patch.multiple(oscompat, IS_MAC=False, IS_WINDOWS=True), \
+                mock.patch("zoho_timelog.oscompat.run", side_effect=OSError("no powershell")):
+            oscompat.notify("T", "msg", "http://x/")   # never raises
+
+    def test_claude_cmd(self):
+        from unittest import mock
+        with mock.patch("zoho_timelog.sources.shutil.which", return_value=None):
+            self.assertRaises(FileNotFoundError, src.claude_cmd)
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = Path(tmp, "claude.cmd")
+            script = Path(tmp, "node_modules", "@anthropic-ai", "claude-code", "cli.js")
+            script.parent.mkdir(parents=True)
+            script.touch()
+            which = {"claude": str(shim), "node": "C:/node/node.exe"}.get
+            with mock.patch("zoho_timelog.sources.shutil.which", side_effect=which):
+                self.assertEqual(src.claude_cmd(), ["C:/node/node.exe", str(script)])
+        with mock.patch("zoho_timelog.sources.shutil.which", return_value="/usr/local/bin/claude"):
+            self.assertEqual(src.claude_cmd(), ["/usr/local/bin/claude"])
+
+    def test_log_option_sends_output_to_file(self):
+        saved = sys.stdout, sys.stderr
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp, "sub", "scheduler.log")
+            try:
+                cli.setup_output(str(log))
+                print("drafted → 2 · ok")
+                print("oops", file=sys.stderr)
+            finally:
+                sys.stdout.close()
+                sys.stdout, sys.stderr = saved
+            self.assertEqual(log.read_text(encoding="utf-8"), "drafted → 2 · ok\noops\n")
+
+
+class SchedulerTest(unittest.TestCase):
+    """Every OS's job files and install calls, checked on whatever OS runs the tests."""
+    CMD = ["/home/a b/.local/bin/timelog"]
+
+    def test_launchd(self):
+        import plistlib
+        draft = plistlib.loads(scheduler.render_launchd("draft", self.CMD, "/x/bin:/usr/bin"))
+        self.assertEqual(draft["Label"], "com.codemonk.timelog")
+        self.assertEqual(draft["ProgramArguments"], [*self.CMD, "--log", str(scheduler.LOGS["draft"]), "draft"])
+        self.assertEqual(draft["StartCalendarInterval"], [{"Hour": 10, "Minute": 0}, {"Hour": 15, "Minute": 0}])
+        self.assertEqual((draft["RunAtLoad"], draft["EnvironmentVariables"]["PATH"]), (True, "/x/bin:/usr/bin"))
+        self.assertNotIn("KeepAlive", draft)
+        app = plistlib.loads(scheduler.render_launchd("app", self.CMD, "/x"))
+        self.assertEqual((app["Label"], app["KeepAlive"], app["ProgramArguments"][-1]),
+                         ("com.codemonk.timelog.app", True, "app"))
+        self.assertNotIn("StartCalendarInterval", app)
+
+    def test_task_xml(self):
+        import subprocess
+        import xml.etree.ElementTree as ET
+        ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+        cmd = [r"C:\Users\a b\.local\bin\timelogw.exe"]
+        text = scheduler.render_task_xml("draft", cmd, "CORP\\a&b")
+        self.assertTrue(text.startswith('<?xml version="1.0" encoding="UTF-16"?>'))
+        root = ET.fromstring(text.split("\n", 1)[1])
+        self.assertEqual(len(root.findall("t:Triggers/t:LogonTrigger", ns)), 1)
+        starts = [e.text for e in root.findall("t:Triggers/t:CalendarTrigger/t:StartBoundary", ns)]
+        self.assertEqual([s[-8:] for s in starts], ["10:00:00", "15:00:00"])
+        self.assertEqual(root.find("t:Principals/t:Principal/t:UserId", ns).text, "CORP\\a&b")
+        self.assertEqual(root.find("t:Principals/t:Principal/t:LogonType", ns).text, "InteractiveToken")
+        self.assertEqual(root.find("t:Settings/t:StartWhenAvailable", ns).text, "true")
+        self.assertEqual(root.find("t:Actions/t:Exec/t:Command", ns).text, cmd[0])
+        log = str(scheduler.LOGS["draft"])
+        self.assertEqual(root.find("t:Actions/t:Exec/t:Arguments", ns).text,
+                         subprocess.list2cmdline(["--log", log, "draft"]))
+
+        app = ET.fromstring(scheduler.render_task_xml("app", cmd, "u").split("\n", 1)[1])
+        self.assertEqual(app.findall("t:Triggers/t:CalendarTrigger", ns), [])
+        self.assertEqual(app.find("t:Settings/t:ExecutionTimeLimit", ns).text, "PT0S")
+        self.assertEqual(app.find("t:Settings/t:RestartOnFailure/t:Count", ns).text, "999")
+
+    def test_systemd(self):
+        units = scheduler.render_systemd(self.CMD, "/x/bin:/usr/bin")
+        self.assertEqual(set(units), {"timelog-app.service", "timelog-draft.service", "timelog-draft.timer"})
+        timer = units["timelog-draft.timer"]
+        for line in ("OnCalendar=*-*-* 10,15:00:00", "Persistent=true", "OnStartupSec=1min", "WantedBy=timers.target"):
+            self.assertIn(line, timer)
+        app = units["timelog-app.service"]
+        self.assertIn(f'ExecStart="/home/a b/.local/bin/timelog" "--log" "{scheduler.LOGS["app"]}" "app"', app)
+        self.assertIn('Environment="PATH=/x/bin:/usr/bin"', app)
+        self.assertIn("Restart=always", app)
+        self.assertIn("Type=oneshot", units["timelog-draft.service"])
+        self.assertIn('"50%%"', scheduler.render_systemd(["50%"], "")["timelog-draft.service"])
+
+    def fake_os(self, mac=False, windows=False, returncode=0):
+        """Pretend to be another OS: a temp home, and every command recorded instead of run."""
+        from unittest import mock
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return mock.Mock(returncode=returncode, stdout="", stderr="")
+        self.enterContext(mock.patch.multiple(oscompat, IS_MAC=mac, IS_WINDOWS=windows))
+        self.enterContext(mock.patch.object(Path, "home", return_value=home))
+        self.enterContext(mock.patch.object(scheduler, "run", side_effect=fake_run))
+        self.enterContext(mock.patch.object(scheduler, "TIMELOG_DIR", home / ".timelog"))
+        if mac:
+            self.enterContext(mock.patch.object(scheduler.os, "getuid", return_value=501, create=True))
+        return home, calls
+
+    def test_install_linux(self):
+        home, calls = self.fake_os()
+        scheduler.install(self.CMD)
+        units = home / ".config" / "systemd" / "user"
+        self.assertEqual(sorted(p.name for p in units.iterdir()),
+                         ["timelog-app.service", "timelog-draft.service", "timelog-draft.timer"])
+        self.assertIn(["systemctl", "--user", "enable", "--now", "timelog-draft.timer", "timelog-app.service"], calls)
+        scheduler.uninstall()
+        self.assertEqual(list(units.iterdir()), [])
+
+    def test_install_linux_without_systemd(self):
+        self.fake_os(returncode=1)
+        with self.assertRaises(scheduler.Unavailable) as ctx:
+            scheduler.install(self.CMD)
+        self.assertIn("0 10,15 * * * '/home/a b/.local/bin/timelog' --log", str(ctx.exception))
+        self.assertIn("@reboot '/home/a b/.local/bin/timelog' --log", str(ctx.exception))
+        self.assertEqual(scheduler.loaded(), {"crontab (no systemd here)": False})   # doctor checks the crontab
+
+    def test_install_windows(self):
+        home, calls = self.fake_os(windows=True)
+        scheduler.install([r"C:\x\timelog.exe"])
+        creates = [c for c in calls if c[:2] == ["schtasks", "/Create"]]
+        self.assertEqual([c[3] for c in creates], ["codemonk-timelog-draft", "codemonk-timelog-app"])
+        self.assertEqual(calls[-1], ["schtasks", "/Run", "/TN", "codemonk-timelog-app"])
+        xml = home / ".timelog" / "codemonk-timelog-draft.xml"
+        self.assertTrue(xml.read_bytes().startswith((b"\xff\xfe", b"\xfe\xff")))   # UTF-16 with a BOM
+        self.assertIn("<Command>C:\\x\\timelog.exe</Command>", xml.read_text(encoding="utf-16"))
+
+    def test_install_mac(self):
+        home, calls = self.fake_os(mac=True)
+        scheduler.install(self.CMD)
+        agents = home / "Library" / "LaunchAgents"
+        self.assertEqual(sorted(p.name for p in agents.iterdir()),
+                         ["com.codemonk.timelog.app.plist", "com.codemonk.timelog.plist"])
+        boots = [c for c in calls if c[:2] == ["launchctl", "bootstrap"]]
+        self.assertEqual([c[2] for c in boots], ["gui/501", "gui/501"])
+
+    def test_install_failure_says_why(self):
+        from unittest import mock
+        self.fake_os()
+        with mock.patch.object(scheduler, "run", side_effect=lambda cmd, **kw: mock.Mock(
+                returncode=0 if "show-environment" in cmd else 1, stdout="", stderr="Failed to connect to bus")):
+            with self.assertRaises(RuntimeError) as ctx:
+                scheduler.install(self.CMD)
+        self.assertIn("Failed to connect to bus", str(ctx.exception))
+
+    def test_uninstall_removes_hook_and_forwarder(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, old = Path(tmp, "settings.json"), Path(tmp, "timelog.sh")
+            other = {"type": "command", "command": "/bin/other"}
+            settings.write_text(json.dumps({"hooks": {"UserPromptSubmit": [
+                {"hooks": [other]}, {"hooks": [{"type": "command", "command": '"/x/timelog" hook'}]}]}}))
+            old.write_text('#!/bin/sh\nexec "/x/timelog" hook\n')
+            with mock.patch.object(cli, "CLAUDE_SETTINGS", settings), mock.patch.object(cli, "OLD_HOOK_FILE", old), \
+                    mock.patch.object(scheduler, "uninstall", return_value=[]), \
+                    mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
+                cli.cmd_uninstall(None)
+            self.assertEqual(json.loads(settings.read_text())["hooks"]["UserPromptSubmit"], [{"hooks": [other]}])
+            self.assertFalse(old.exists())
+
+
+class ZohoAuthTest(unittest.TestCase):
+    """Personal Self Client auth: Connect Zoho saves your own credentials; ZOHO_* env values win."""
+    ENV = ("ZOHO_CLIENT_ID", "ZOHO_CLIENT_SECRET", "ZOHO_REFRESH_TOKEN", "ZOHO_USER")
+
+    def setUp(self):
+        from unittest import mock
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.file = tmp / "zoho_token.json"
+        self.enterContext(mock.patch.object(zoho, "ZOHO_TOKEN_FILE", self.file))
+        self.enterContext(mock.patch.dict(os.environ))
+        for key in self.ENV:
+            os.environ.pop(key, None)
+        zoho.disconnect()   # clears the cached access token too
+
+    def reply(self, body):
+        from unittest import mock
+        return mock.Mock(json=mock.Mock(return_value=body))
+
+    def test_not_connected(self):
+        self.assertEqual(zoho.auth_status(), {"connected": False})
+        self.assertRaises(zoho.NotConnected, zoho.credentials)
+        self.assertRaises(zoho.NotConnected, zoho.token)
+
+    def test_connect_saves_your_client_and_token(self):
+        from unittest import mock
+        with mock.patch.object(zoho.requests, "post", return_value=self.reply(
+                {"access_token": "at-1", "refresh_token": "rt-1"})) as post, \
+                mock.patch.object(zoho.requests, "get", return_value=self.reply({"Email": "me@codemonk.io"})):
+            self.assertEqual(zoho.connect(" id-1 ", "secret-1\n", " code-1 "), "me@codemonk.io")
+        self.assertTrue(post.call_args.args[0].endswith("/oauth/v2/token"))
+        self.assertEqual(post.call_args.kwargs["data"], {"grant_type": "authorization_code", "client_id": "id-1",
+                                                         "client_secret": "secret-1", "code": "code-1"})
+        saved = json.loads(self.file.read_text())
+        self.assertEqual((saved["client_id"], saved["client_secret"], saved["refresh_token"], saved["user"]),
+                         ("id-1", "secret-1", "rt-1", "me@codemonk.io"))
+        if os.name == "posix":
+            self.assertEqual(self.file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(zoho.auth_status(), {"connected": True, "user": "me@codemonk.io", "source": "file"})
+        self.assertEqual(zoho.user(), "me@codemonk.io")
+        self.assertEqual(zoho.token(), "at-1")   # cached from the exchange: no second request
+
+        with mock.patch.object(zoho.requests, "post", return_value=self.reply({"access_token": "at-2"})) as post:
+            zoho._token_cache.update(at=0.0, token=None)
+            self.assertEqual(zoho.token(), "at-2")
+        self.assertEqual(post.call_args.kwargs["data"]["refresh_token"], "rt-1")
+
+        self.assertTrue(zoho.disconnect())
+        self.assertFalse(self.file.exists())
+        self.assertEqual(zoho.auth_status(), {"connected": False})
+
+    def test_connect_errors_say_what_to_do(self):
+        from unittest import mock
+        self.assertRaisesRegex(ValueError, "Paste the Client ID", zoho.connect, "id", "", "code")
+        for error, hint in (("invalid_code", "expired or was already used"), ("invalid_client", "Client ID"),
+                            ("something_new", "something_new")):
+            with mock.patch.object(zoho.requests, "post", return_value=self.reply({"error": error})):
+                self.assertRaisesRegex(ValueError, hint, zoho.connect, "id", "secret", "code")
+        self.assertFalse(self.file.exists())
+
+        tokens = self.reply({"access_token": "at", "refresh_token": "rt"})
+        with mock.patch.object(zoho.requests, "post", return_value=tokens), \
+                mock.patch.object(zoho.requests, "get", return_value=self.reply({})):
+            self.assertRaisesRegex(ValueError, "email", zoho.connect, "id", "secret", "code")
+        with mock.patch.object(zoho.requests, "post", return_value=tokens), \
+                mock.patch.object(zoho.requests, "get") as get:
+            self.assertEqual(zoho.connect("id", "secret", "code", "typed@codemonk.io"), "typed@codemonk.io")
+        get.assert_not_called()
+
+    def test_env_wins_over_the_file(self):
+        self.file.write_text(json.dumps({"client_id": "f", "client_secret": "f", "refresh_token": "f",
+                                         "user": "file@x.io"}))
+        self.assertEqual(zoho.credentials()["source"], "file")
+        os.environ.update(ZOHO_CLIENT_ID="env-id", ZOHO_CLIENT_SECRET="env-secret-xyz", ZOHO_REFRESH_TOKEN="env-rt",
+                          ZOHO_USER="env@x.io")
+        self.assertEqual((zoho.credentials()["source"], zoho.user()), ("env", "env@x.io"))
+        self.assertEqual(zoho._redact("failed for env-secret-xyz"), "failed for ***")
+
+    @unittest.skipUnless(__import__("importlib").util.find_spec("httpx"), "needs httpx (uv sync --group dev)")
+    def test_routes(self):
+        from unittest import mock
+        from starlette.testclient import TestClient
+        from zoho_timelog import review_app
+        client = TestClient(review_app.make_app(8765), base_url="http://127.0.0.1:8765")
+        status = client.get("/api/auth").json()
+        self.assertEqual((status["connected"], status["scopes"]), (False, review_app.ZOHO_SCOPES))
+        self.assertEqual(client.get("/api/days").status_code, 401)            # not connected → the page shows the form
+        self.assertTrue(client.get("/api/days").json()["connect"])
+        body = {"client_id": "id", "client_secret": "s", "code": "c"}
+        self.assertEqual(client.post("/api/auth/connect", json=body).status_code, 403)   # no X-Timelog header
+        hdr = {"X-Timelog": "1"}
+        with mock.patch.object(zoho.requests, "post", return_value=self.reply({"error": "invalid_code"})):
+            bad = client.post("/api/auth/connect", json=body, headers=hdr)
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn("expired", bad.json()["error"])
+        with mock.patch.object(zoho.requests, "post", return_value=self.reply({"access_token": "a", "refresh_token": "r"})), \
+                mock.patch.object(zoho.requests, "get", return_value=self.reply({"Email": "me@codemonk.io"})):
+            ok = client.post("/api/auth/connect", json=body, headers=hdr)
+        self.assertEqual(ok.json(), {"connected": True, "user": "me@codemonk.io"})
+        self.assertEqual(client.post("/api/auth/disconnect", headers=hdr).json(), {"connected": False})
 
 
 if __name__ == "__main__":

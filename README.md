@@ -1,14 +1,16 @@
 # Zoho People Time Logs: drafts you review
 
+[![CI](https://github.com/alanchrissantony/Zoho-Time-Draft/actions/workflows/ci.yml/badge.svg)](https://github.com/alanchrissantony/Zoho-Time-Draft/actions/workflows/ci.yml)
+
 Every morning this turns yesterday's Claude Code activity and Outlook meetings into **draft**
 Zoho People time logs. You accept, edit or decline them in a small local app, and only accepted
-drafts are logged. If a weekday has nothing in Zoho, you get a macOS notification.
+drafts are logged. If a weekday has nothing in Zoho, you get a desktop notification.
 
 ```
-Claude Code prompts ── UserPromptSubmit hook (hooks/timelog.sh) ──► ~/.timelog/YYYY-MM-DD.jsonl
+Claude Code prompts ── UserPromptSubmit hook (timelog hook) ─────► ~/.timelog/YYYY-MM-DD.jsonl
 Outlook calendar ───── claude.ai Microsoft 365 connector (read-only) ┐
                                                                      ▼
-launchd: at login, 10:00, 15:00 ── timelog.py draft  (finished days only)
+scheduled: at login, 10:00, 15:00 ── timelog draft  (finished days only)
    ├─ minute timeline: meetings first, then Claude Code work blocks (no double counting)
    ├─ repo / meeting → Zoho project via ~/.timelog/projects.json
    ├─ claude -p, no tools: picks the job, writes a one-line description, suggests projects
@@ -21,22 +23,59 @@ review app  http://127.0.0.1:8765   Accept ─► Zoho People API      Edit · D
 
 ---
 
-## Setup
+## Install
 
-Prerequisites: Python 3.12+, `jq`, `git`, the Claude Code CLI logged in with your claude.ai
-account, and the **Microsoft 365** connector connected in claude.ai (for meetings).
+Works on **macOS, Windows and Linux**. You need [Claude Code](https://docs.claude.com/en/docs/claude-code)
+logged in with your claude.ai account, `git`, and (for meetings) the **Microsoft 365** connector
+connected in claude.ai → Settings → Connectors. Python comes with uv; you don't install it yourself.
+
+**1. Install uv** (once):
+
+| macOS / Linux | Windows (PowerShell) |
+|---|---|
+| `curl -LsSf https://astral.sh/uv/install.sh \| sh` | `powershell -c "irm https://astral.sh/uv/install.ps1 \| iex"` |
+
+Open a new terminal afterwards so `uv` and the tools it installs (in `~/.local/bin`) are on your PATH.
+If `timelog` isn't found later, run `uv tool update-shell` and open a new terminal.
+
+**2. Install the tool and set it up:**
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env            # fill in Zoho credentials (see SETUP_GUIDE.md)
-.venv/bin/python timelog.py install
-brew install terminal-notifier  # optional: clicking a notification opens the app
+uv tool install git+https://github.com/alanchrissantony/Zoho-Time-Draft.git
+timelog install
 ```
 
-`install` registers the capture hook, seeds `~/.timelog/projects.json`, and loads two launchd
-jobs: the morning draft job and the review app. It also unregisters the `zoho-timesheet` chat
-MCP server left by older installs. You can run it again safely.
+`timelog install` registers the Claude Code hook, creates `~/.timelog`, schedules the two background
+jobs (the draft job and the review app) and opens the review app.
+
+**3. Connect Zoho** in the page that opens, with your own Zoho Self Client: about two minutes, every
+step is on the page (or run `timelog login`). Details and troubleshooting: [SETUP_GUIDE.md](SETUP_GUIDE.md).
+
+**4. Check:** `timelog doctor` should say OK on every line.
+
+| | macOS | Windows | Linux |
+|---|---|---|---|
+| Background jobs | launchd agents `com.codemonk.timelog`, `com.codemonk.timelog.app` | Task Scheduler tasks `codemonk-timelog-draft`, `codemonk-timelog-app` (your user, no admin) | systemd user units `timelog-draft.timer`, `timelog-app.service` |
+| Your data and settings | `~/.timelog/` | `%USERPROFILE%\.timelog\` | `~/.timelog/` |
+| Notifications | Notification Center (`brew install terminal-notifier` makes a click open the app) | a toast; clicking it opens the app | `notify-send`, if your desktop has it |
+
+On Linux without systemd (WSL, containers) `timelog install` prints the crontab lines to add instead.
+
+### Update
+
+```bash
+uv tool upgrade zoho-timelog
+timelog install        # safe to re-run; picks up any change to the hook or jobs
+```
+
+### Uninstall
+
+```bash
+timelog uninstall               # removes the hook and the jobs; keeps ~/.timelog
+uv tool uninstall zoho-timelog
+```
+
+Delete `~/.timelog` as well if you want your drafts, logs and Zoho connection gone.
 
 ---
 
@@ -72,7 +111,7 @@ declined, edited or added.
 - Each draft's total is rounded to the nearest **15 min**; drafts that round to 0 go to "Not counted".
 
 Repos and meetings that map to the same Zoho job are combined into one draft. These numbers, and
-every other setting and path, are in [constants.py](constants.py).
+every other setting and path, are in [constants.py](zoho_timelog/constants.py).
 
 ---
 
@@ -104,17 +143,20 @@ every other setting and path, are in [constants.py](constants.py).
 ## Commands
 
 ```bash
-.venv/bin/python timelog.py status                 # today's capture, jobs, drafts to review, missed days
-.venv/bin/python timelog.py calc 2026-10-28        # a day's timeline (local only, no meetings)
-.venv/bin/python timelog.py draft 2026-10-28       # (re)make one day's drafts
-.venv/bin/python timelog.py draft                  # what launchd runs: finished days + missed-day check
-.venv/bin/python timelog.py accept 2026-10-28 --all   # log a day's drafts without the app
-.venv/bin/python timelog.py app                    # run the review app in the foreground
+timelog status                    # today's capture, jobs, drafts to review, missed days
+timelog doctor                    # check the setup; says what to fix
+timelog login                     # connect Zoho from the terminal (same as the app's form)
+timelog calc 2026-10-28           # a day's timeline (local only, no meetings)
+timelog draft 2026-10-28          # (re)make one day's drafts
+timelog draft                     # what the scheduled job runs: finished days + missed-day check
+timelog accept 2026-10-28 --all   # log a day's drafts without the app
+timelog app                       # run the review app in the foreground
+timelog install / uninstall       # set up or remove the hook and the jobs
 ```
 
 ### When drafts get made
 
-| Mac state | Yesterday's drafts are made… |
+| Computer at 10:00 | Yesterday's drafts are made… |
 |---|---|
 | On at 10:00 | at 10:00 |
 | Asleep at 10:00 | when it wakes |
@@ -124,14 +166,23 @@ The 15:00 run reminds you again if something is still missed or waiting. Drafts 
 last 7 days from install on (weekends only if you used Claude Code). Missed weekdays are checked
 for the last 14 days. Work after midnight counts toward the next day.
 
-Draft runs and every accept are logged in `~/.timelog/run.log`.
+Draft runs and every accept are logged in `~/.timelog/run.log`; the jobs' own output goes to
+`~/.timelog/scheduler.log` and `~/.timelog/app.log`.
+
+### Settings: `~/.timelog/config.env`
+
+Optional; `timelog install` creates it with every option commented out. The common ones:
+`TIMELOG_MEETINGS=0` (don't read Outlook), `TIMELOG_MODEL` / `TIMELOG_MEETINGS_MODEL` (Claude models),
+`ZOHO_DOMAIN` (if your Zoho account isn't on zoho.in), `TIMELOG_PORT` (if 8765 is taken).
+Restart the app afterwards (`timelog install` does it).
 
 ---
 
 ## Privacy and permissions
 
-- Zoho credentials live only in `.env` (gitignored) and are read by the repo's code. They never
-  reach the review page or Claude.
+- You connect Zoho with your own Self Client. Its Client ID, Client Secret and refresh token are
+  saved only in `~/.timelog/zoho_token.json` (readable by you alone) and used only by this tool's
+  code. The review page sends them once, to save them, and never gets them back; Claude never sees them.
 - The review app listens on 127.0.0.1 only, rejects other `Host` headers, and requires an
   `X-Timelog` header on every change, so other websites can't drive it.
 - Prompt text stays in `~/.timelog`. The draft step's `claude -p` call sees prompt excerpts,
@@ -147,8 +198,9 @@ Draft runs and every accept are logged in `~/.timelog/run.log`.
 - Only Claude Code and calendar meetings are seen. Add other work with **Add entry**.
 - A meeting counts when it's on your calendar, whether or not you joined. Decline the ones you skipped.
 - A session that runs past midnight is split by date.
-- If the `claude` login, the Microsoft 365 connector or the Zoho refresh token expires, the
-  day's drafts get a note explaining what's missing; regenerate once it's fixed.
+- If the `claude` login, the Microsoft 365 connector or your Zoho connection stops working, the
+  day's drafts get a note explaining what's missing; `timelog doctor` says what to fix. Regenerate
+  the day once it's fixed.
 
 ---
 
@@ -156,14 +208,34 @@ Draft runs and every accept are logged in `~/.timelog/run.log`.
 
 | File | Purpose |
 |---|---|
-| `timelog.py` | CLI: `calc`, `draft`, `accept`, `app`, `install`, `status` |
-| `constants.py` | Settings, paths and limits used everywhere; loads `.env` |
-| `drafts.py` | Timeline, draft store, generate, accept, missed days, notifications |
-| `sources.py` | Activity sources: Claude Code prompts, Outlook meetings, git; headless Claude |
-| `review_app.py` + `web/index.html` | Review app |
-| `hooks/timelog.sh` | Claude Code `UserPromptSubmit` capture hook |
-| `prompts/nightly.md` | Instructions for the job choice, descriptions and suggestions |
-| `projects.example.json` | Starting repo / meeting → Zoho mapping |
-| `launchd/*.plist` | launchd templates: daily draft job, review app |
-| `zoho_api.py` | The one Zoho layer: credentials, cached auth, reads, open-jobs catalog, add a log, time helpers |
-| `tests/` | `python -m unittest discover tests` |
+| `pyproject.toml` | Package `zoho-timelog`; the `timelog` command |
+| `zoho_timelog/__main__.py` | Entry point; runs `hook` before loading anything heavy |
+| `zoho_timelog/cli.py` | CLI: `install`, `uninstall`, `doctor`, `login`, `status`, `calc`, `draft`, `accept`, `app`, `hook` |
+| `zoho_timelog/hook.py` | Claude Code `UserPromptSubmit` capture hook (`timelog hook`) |
+| `zoho_timelog/constants.py` | Settings, paths and limits; loads `~/.timelog/config.env` (and `.env` in a checkout) |
+| `zoho_timelog/oscompat.py` | What differs by OS: subprocesses, file lock, notifications |
+| `zoho_timelog/drafts.py` | Timeline, draft store, generate, accept, missed days, notifications |
+| `zoho_timelog/sources.py` | Activity sources: Claude Code prompts, Outlook meetings, git; headless Claude |
+| `zoho_timelog/review_app.py` + `web/index.html` | Review app |
+| `zoho_timelog/zoho_api.py` | The one Zoho layer: your Self Client connection, cached auth, reads, open-jobs catalog, add a log, time helpers |
+| `zoho_timelog/prompts/nightly.md` | Instructions for the job choice, descriptions and suggestions |
+| `zoho_timelog/projects.example.json`, `config.example.env` | Seeds for `~/.timelog/projects.json` and `config.env` |
+| `zoho_timelog/scheduler.py` | Scheduled jobs: launchd (macOS), Task Scheduler (Windows), systemd (Linux) |
+| `tests/` | `uv run python -m unittest discover tests` |
+
+---
+
+## Development
+
+```bash
+git clone https://github.com/alanchrissantony/Zoho-Time-Draft.git
+cd Zoho-Time-Draft
+uv tool install -e .                               # `timelog` runs this checkout; edits apply right away
+timelog install
+uv run --group dev python -m unittest discover tests   # the dev group adds httpx for the route tests
+```
+
+In a checkout, `ZOHO_CLIENT_ID`, `ZOHO_CLIENT_SECRET`, `ZOHO_REFRESH_TOKEN` and `ZOHO_USER` in a `.env`
+at the repo root take precedence over Connect Zoho (see the end of [SETUP_GUIDE.md](SETUP_GUIDE.md)).
+Restart the review app after changing its code: `timelog install`, or `launchctl kickstart -k
+gui/$(id -u)/com.codemonk.timelog.app` on macOS.

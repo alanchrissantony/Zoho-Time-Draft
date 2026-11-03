@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Git identity
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+      - name: Unit tests
+        run: uv run --python ${{ matrix.python }} --group dev python -m unittest discover -v tests
+
+  install:
+    # A teammate's path: install the tool, `timelog install`, a prompt through the hook, uninstall
+    name: install, hook, uninstall (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Git identity
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+      - name: Install the tool
+        run: uv tool install --python 3.12 .
+      - name: Put uv's tool folder on PATH
+        shell: bash
+        run: uv tool dir --bin >> "$GITHUB_PATH"
+      - name: Install, use the hook, uninstall
+        run: uv run --no-project --python 3.12 python tests/smoke_install.py
