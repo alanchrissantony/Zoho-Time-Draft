@@ -155,7 +155,8 @@ def main() -> int:
     print("\n== uninstall")
     run(["timelog", "uninstall"])
     check(our_hook_commands() == [], "hook removed from settings.json")
-    check(not any(jobs_present().values()), "scheduled jobs removed")
+    left = [name for name, present in jobs_present().items() if present]
+    check(not left, f"scheduled jobs removed (still there: {left})" if left else "scheduled jobs removed")
 
     print(f"\n{len(failures)} failure(s)" + "".join(f"\n  - {f}" for f in failures))
     if failures:

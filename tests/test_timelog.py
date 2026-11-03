@@ -667,6 +667,27 @@ class SchedulerTest(unittest.TestCase):
         boots = [c for c in calls if c[:2] == ["launchctl", "bootstrap"]]
         self.assertEqual([c[2] for c in boots], ["gui/501", "gui/501"])
 
+    def test_uninstall_mac_waits_for_launchd(self):
+        from unittest import mock
+        home, _ = self.fake_os(mac=True)
+        scheduler.install(self.CMD)
+        bootouts: dict[str, int] = {}
+
+        def launchd(cmd, **kw):   # an agent stays listed until its second bootout
+            if cmd[1] == "bootout":
+                bootouts[cmd[2]] = bootouts.get(cmd[2], 0) + 1
+            listed = cmd[1] == "print" and bootouts.get(cmd[2], 0) < 2
+            return mock.Mock(returncode=0 if listed else 1, stdout="", stderr="")
+        with mock.patch.object(scheduler, "run", side_effect=launchd), mock.patch.object(scheduler.time, "sleep"):
+            done = scheduler.uninstall()
+        self.assertEqual(done, ["removed launchd agent com.codemonk.timelog", "removed launchd agent com.codemonk.timelog.app"])
+        self.assertEqual(list((home / "Library" / "LaunchAgents").iterdir()), [])
+
+        with mock.patch.object(scheduler, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="Boot-out failed: 5")), \
+                mock.patch.object(scheduler.time, "sleep"):   # never goes: say so, with launchctl's reason
+            done = scheduler.uninstall()
+        self.assertIn("couldn't unload com.codemonk.timelog: Boot-out failed: 5", done[0])
+
     def test_install_failure_says_why(self):
         from unittest import mock
         self.fake_os()

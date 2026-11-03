@@ -27,6 +27,7 @@ TASKS       = {"draft": "codemonk-timelog-draft", "app": "codemonk-timelog-app"}
 UNITS       = {"draft": "timelog-draft.timer", "app": "timelog-app.service"}
 LOGS        = {"draft": SCHED_LOG, "app": APP_LOG}
 DRAFT_HOURS = (10, 15)
+UNLOAD_TRIES = 10   # × 0.5 s for launchd to let go of an agent on uninstall
 
 
 class Unavailable(RuntimeError):
@@ -146,7 +147,17 @@ def _launchd_install(cmd: list[str]) -> list[str]:
 def _launchd_uninstall() -> list[str]:
     done = []
     for job in JOBS:
-        run(["launchctl", "bootout", f"{_domain()}/{LAUNCHD[job]}"], capture_output=True)
+        target = f"{_domain()}/{LAUNCHD[job]}"
+        # bootout can still be finishing when it returns (a job that's running is stopped first): retry
+        # until launchd no longer lists the agent, and say so if it never goes
+        for _ in range(UNLOAD_TRIES):
+            if not _ok(["launchctl", "print", target]):
+                break
+            error = run(["launchctl", "bootout", target], capture_output=True, text=True).stderr.strip()
+            time.sleep(0.5)
+        else:
+            done.append(f"couldn't unload {LAUNCHD[job]}: {error or 'still loaded'}; "
+                        f"run: launchctl bootout {target}")
         if _plist_path(job).exists():
             _plist_path(job).unlink()
             done.append(f"removed launchd agent {LAUNCHD[job]}")
