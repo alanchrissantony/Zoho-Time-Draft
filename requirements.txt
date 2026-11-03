@@ -1,0 +1,4 @@
+python-dotenv==1.2.2
+requests==2.33.1
+starlette==1.10.0
+uvicorn==0.54.0

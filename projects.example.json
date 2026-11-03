@@ -1,0 +1,43 @@
+{
+  "groups": {
+    "codemonk/tools": {
+      "project": "Codemonk Internal Work",
+      "job": "Codemonk Internal Projects (Document Intelligence, Timesheet Automation Bot, HR Bots etc)"
+    },
+    "codemonk/website": {
+      "project": "Codemonk Internal Work",
+      "job": "Codemonk Internal Projects (Document Intelligence, Timesheet Automation Bot, HR Bots etc)"
+    },
+    "codemonk/v-walk": {
+      "project": "[Project] Radyus - Quick Commerce Application",
+      "job": "auto"
+    },
+    "codemonk/tata-power/image-analytics-based-safety-solution": {
+      "project": "[Project] Tata Power Image Analytics For Site Safety",
+      "job": "auto"
+    },
+    "codemonk/kawada": {
+      "project": "[Project] Kawada - AI RAG Feature Enhancements",
+      "job": "auto"
+    }
+  },
+  "repos": {
+    "bruno": {
+      "project": "Codemonk Internal Work",
+      "job": "Codemonk Internal Projects (Document Intelligence, Timesheet Automation Bot, HR Bots etc)"
+    },
+    "3_days_tasks": {
+      "project": "Codemonk Internal Work",
+      "job": "Codemonk Internal Projects (Document Intelligence, Timesheet Automation Bot, HR Bots etc)"
+    }
+  },
+  "ignore": [],
+  "meetings": [
+    {
+      "match": "TATA Power Image Analytics",
+      "project": "[Project] Tata Power Image Analytics For Site Safety",
+      "job": "auto"
+    }
+  ],
+  "ignore_meetings": []
+}

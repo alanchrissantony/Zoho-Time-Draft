@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zoho Time Log</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1c2330; --muted: #667085; --line: #e3e6eb;
+    --accent: #2f6fde; --accent-text: #ffffff; --soft: #eef3fd;
+    --red: #c4372d; --red-soft: #fdecea; --amber: #a86200; --amber-soft: #fff4e0;
+    --green: #1f7a4a; --green-soft: #e6f5ec; --blue: #3b5bab; --blue-soft: #e9eefb;
+    --gray-soft: #f0f1f3; --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151b; --panel: #1a1f27; --text: #e6e9ef; --muted: #98a2b3; --line: #2b323d;
+      --accent: #5b8ff0; --accent-text: #0b1020; --soft: #1d2a42;
+      --red: #f0786e; --red-soft: #3a1f1d; --amber: #f2b45a; --amber-soft: #3a2c16;
+      --green: #5cc98f; --green-soft: #183326; --blue: #8fa8ec; --blue-soft: #1f2843;
+      --gray-soft: #232a34; --shadow: none;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12151b; --panel: #1a1f27; --text: #e6e9ef; --muted: #98a2b3; --line: #2b323d;
+    --accent: #5b8ff0; --accent-text: #0b1020; --soft: #1d2a42;
+    --red: #f0786e; --red-soft: #3a1f1d; --amber: #f2b45a; --amber-soft: #3a2c16;
+    --green: #5cc98f; --green-soft: #183326; --blue: #8fa8ec; --blue-soft: #1f2843;
+    --gray-soft: #232a34; --shadow: none;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+           padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 20px; padding: 20px;
+         max-width: 1180px; margin: 0 auto; }
+  main > * { min-width: 0; }
+  @media (max-width: 760px) {
+    main { grid-template-columns: minmax(0, 1fr); padding: 16px; gap: 14px; }
+    .days { display: flex; overflow-x: auto; }
+    .days .day { flex: 0 0 auto; flex-direction: column; align-items: flex-start; gap: 4px; width: auto;
+                 border-bottom: 0; border-right: 1px solid var(--line); }
+    .days .day.sel { box-shadow: inset 0 -3px 0 var(--accent); }
+  }
+
+  .days { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+          box-shadow: var(--shadow); overflow: hidden; align-self: start; }
+  .day { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%;
+         padding: 10px 14px; border: 0; border-bottom: 1px solid var(--line); background: none;
+         color: inherit; font: inherit; text-align: left; cursor: pointer; }
+  .day:last-child { border-bottom: 0; }
+  .day:hover { background: var(--gray-soft); }
+  .day.sel { background: var(--soft); box-shadow: inset 3px 0 0 var(--accent); }
+  .day > span { white-space: nowrap; }
+  .day .r { display: flex; gap: 6px; align-items: center; }
+  .day .d { font-weight: 550; } .day .w { color: var(--muted); font-size: 12px; margin-left: 6px; }
+  .day .h { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+  .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 550;
+          white-space: nowrap; background: var(--gray-soft); color: var(--muted); }
+  .chip.missed { background: var(--red-soft); color: var(--red); }
+  .chip.review, .chip.pending { background: var(--amber-soft); color: var(--amber); }
+  .chip.logged, .chip.submitted, .chip.in_zoho { background: var(--green-soft); color: var(--green); }
+  .chip.leave, .chip.holiday, .chip.today { background: var(--blue-soft); color: var(--blue); }
+  .chip.failed { background: var(--red-soft); color: var(--red); }
+  .chip.suggested { background: var(--soft); color: var(--accent); }
+
+  .detail { min-width: 0; }
+  .titlebar { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+  .titlebar h2 { margin: 0; font-size: 20px; font-weight: 650; }
+  .summary { color: var(--muted); margin-bottom: 14px; font-variant-numeric: tabular-nums; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .note { background: var(--amber-soft); color: var(--amber); border-radius: 8px; padding: 8px 12px;
+          margin-bottom: 10px; font-size: 13px; }
+
+  button.btn { font: inherit; font-size: 13px; font-weight: 550; padding: 6px 12px; border-radius: 7px;
+               border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+  button.btn:hover:not(:disabled) { border-color: var(--muted); }
+  button.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.btn.danger { color: var(--red); }
+  button.btn:disabled { opacity: .5; cursor: default; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+          box-shadow: var(--shadow); padding: 14px 16px; margin-bottom: 12px; }
+  .card.done { opacity: .72; }
+  .card .top { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+  .card .proj { font-weight: 650; overflow-wrap: anywhere; }
+  .card .job { color: var(--muted); overflow-wrap: anywhere; }
+  .card .job.warn { color: var(--red); font-weight: 550; }
+  .card .hours { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .card .desc { margin: 8px 0; overflow-wrap: anywhere; }
+  .card .desc.empty { color: var(--red); }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; color: var(--muted); font-size: 12px; }
+  .items { margin: 6px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+  .actions .err { color: var(--red); font-size: 12px; flex-basis: 100%; overflow-wrap: anywhere; }
+
+  form.edit { display: grid; gap: 10px; margin-top: 10px; }
+  form.edit label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); font-weight: 550; }
+  form.edit label.check { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+  form.edit .row { display: grid; grid-template-columns: 1fr 1fr 110px; gap: 10px; }
+  @media (max-width: 760px) { form.edit .row { grid-template-columns: 1fr; } }
+  select, input, textarea { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+                            border-radius: 7px; padding: 7px 9px; width: 100%; min-width: 0; }
+  textarea { resize: vertical; min-height: 56px; }
+
+  details.section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+                    padding: 10px 16px; margin-bottom: 12px; }
+  details.section summary { cursor: pointer; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-top: 1px solid var(--line); vertical-align: top;
+           overflow-wrap: anywhere; }
+  th { color: var(--muted); font-weight: 550; font-size: 12px; }
+  .empty-state { color: var(--muted); padding: 28px; text-align: center; background: var(--panel);
+                 border: 1px dashed var(--line); border-radius: var(--radius); margin-bottom: 12px; }
+  .toast { position: fixed; right: 16px; bottom: 16px; max-width: min(420px, calc(100vw - 32px));
+           background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 8px;
+           box-shadow: 0 4px 16px rgba(0,0,0,.2); opacity: 0; transform: translateY(8px);
+           transition: .2s; pointer-events: none; overflow-wrap: anywhere; }
+  .toast.show { opacity: 1; transform: none; }
+  .spin { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>Zoho time log</h1><div class="sub" id="sub">Review drafts before they reach Zoho</div></div>
+  <button class="btn" id="refresh" title="Reload">Reload</button>
+</header>
+<main>
+  <nav class="days" id="days" aria-label="Days"><div class="day spin">Loading…</div></nav>
+  <section class="detail" id="detail"></section>
+</main>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+"use strict";
+const STATE_LABEL = { missed: "missed", review: "to review", logged: "logged", leave: "leave", holiday: "holiday",
+                      weekend: "weekend", today: "today", none: "" };
+const STATUS_LABEL = { pending: "pending", declined: "declined", submitted: "logged", failed: "failed", in_zoho: "in Zoho" };
+let days = [], selected = null, catalogs = {}, busy = false;
+
+// ── helpers ──
+function h(tag, attrs = {}, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "value") el.value = v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) if (kid !== null && kid !== undefined && kid !== false)
+    el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  return el;
+}
+const hhmm = m => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+const fmtDate = iso => new Date(iso + "T12:00:00").toLocaleDateString(undefined,
+  { weekday: "long", day: "numeric", month: "short", year: "numeric" });
+const shortDate = iso => new Date(iso + "T12:00:00").toLocaleDateString(undefined, { day: "numeric", month: "short" });
+
+async function api(method, path, body) {
+  const res = await fetch(path, { method, headers: { "X-Timelog": "1", "Content-Type": "application/json" },
+                                  body: body === undefined ? undefined : JSON.stringify(body) });
+  let data = {};
+  try { data = await res.json(); } catch { /* non-JSON error */ }
+  if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
+  return data;
+}
+let toastTimer;
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 4200);
+}
+async function withBusy(btn, label, fn) {
+  if (busy) return;
+  busy = true; const old = btn.textContent; btn.disabled = true; btn.textContent = label;
+  try { await fn(); } catch (e) { toast(e.message); } finally { busy = false; btn.disabled = false; btn.textContent = old; }
+}
+// Projects and jobs open on `date` (not completed, within their dates), or every job with all=true.
+async function loadCatalog(date, all) {
+  const key = all ? "all" : date;
+  if (!catalogs[key]) catalogs[key] = (await api("GET", `/api/catalog?date=${date}${all ? "&all=1" : ""}`)).projects;
+  return catalogs[key];
+}
+
+// ── day list ──
+async function loadDays() {
+  const data = await api("GET", "/api/days");
+  days = data.days;
+  const nav = document.getElementById("days"); nav.replaceChildren();
+  for (const d of days) {
+    const hours = d.zoho_minutes ? hhmm(d.zoho_minutes) : d.open ? `${d.open} draft${d.open > 1 ? "s" : ""}` : "";
+    nav.append(h("button", { class: "day" + (d.date === selected ? " sel" : ""), onclick: () => select(d.date) },
+      h("span", {}, h("span", { class: "d" }, shortDate(d.date)), h("span", { class: "w" }, d.weekday)),
+      h("span", { class: "r" }, hours ? h("span", { class: "h", title: d.zoho_minutes ? "Logged in Zoho" : "" }, hours) : null,
+        STATE_LABEL[d.state] ? h("span", { class: "chip " + d.state }, STATE_LABEL[d.state]) : null)));
+  }
+  const missed = days.filter(d => d.state === "missed").length, open = days.reduce((a, d) => a + d.open, 0);
+  document.getElementById("sub").textContent =
+    [missed ? `${missed} missed day${missed > 1 ? "s" : ""}` : "No missed days", open ? `${open} draft${open > 1 ? "s" : ""} to review` : ""]
+      .filter(Boolean).join(" · ");
+  return data;
+}
+function select(date) {
+  if (location.hash !== "#" + date) location.hash = date; else render();
+}
+
+// ── day detail ──
+async function render() {
+  selected = location.hash.slice(1) || selected;
+  document.querySelectorAll(".day").forEach((el, i) => el.classList.toggle("sel", days[i] && days[i].date === selected));
+  const box = document.getElementById("detail");
+  if (!selected) return;
+  box.replaceChildren(h("div", { class: "spin" }, "Loading…"));
+  let day;
+  try { day = await api("GET", "/api/day/" + selected); }
+  catch (e) { box.replaceChildren(h("div", { class: "note" }, e.message)); return; }
+  if (day.date !== selected) return;  // user moved on
+
+  const open = day.drafts.filter(d => d.status === "pending" || d.status === "failed");
+  const ready = open.filter(d => d.job_id && d.description);
+  const zohoMin = day.zoho.reduce((a, z) => a + toMin(z.hours), 0);
+  const row = days.find(d => d.date === day.date);
+
+  const genBtn = h("button", { class: "btn", disabled: day.is_future,
+    onclick: e => withBusy(e.target, "Working… (about a minute)", async () => {
+      await api("POST", `/api/day/${day.date}/regenerate`); toast("Drafts updated"); await refresh(); }) },
+    day.exists ? "Regenerate" : "Generate drafts");
+  const acceptAll = h("button", { class: "btn primary", disabled: !ready.length,
+    onclick: e => withBusy(e.target, "Logging…", async () => {
+      const r = await api("POST", `/api/day/${day.date}/accept-all`);
+      const ok = r.results.filter(x => x.status === "submitted" || x.status === "in_zoho").length;
+      toast(`${ok} of ${r.results.length} logged`); await refresh(); }) },
+    `Accept all (${ready.length})`);
+  const markSel = h("select", { "aria-label": "Mark day", style: "width:auto",
+    onchange: async e => { try { await api("POST", `/api/day/${day.date}/mark`, { mark: e.target.value || null });
+      toast(e.target.value ? `Marked as ${e.target.value}` : "Mark cleared"); await refresh(); } catch (err) { toast(err.message); } } },
+    h("option", { value: "" }, day.mark ? "Clear mark" : "Mark day as…"),
+    h("option", { value: "leave", selected: day.mark === "leave" }, "Leave"),
+    h("option", { value: "holiday", selected: day.mark === "holiday" }, "Holiday"));
+
+  const list = h("div");
+  box.replaceChildren(...[
+    h("div", { class: "titlebar" }, h("h2", {}, fmtDate(day.date)),
+      row && STATE_LABEL[row.state] ? h("span", { class: "chip " + row.state }, STATE_LABEL[row.state]) : null),
+    h("div", { class: "summary" },
+      `In Zoho ${hhmm(zohoMin)} · Open drafts ${hhmm(open.reduce((a, d) => a + d.minutes, 0))}`,
+      day.generated_at ? ` · drafted ${new Date(day.generated_at).toLocaleString()}` : ""),
+    ...day.notes.map(n => h("div", { class: "note" }, n)),
+    day.is_today ? h("div", { class: "note" }, "Today isn't over: drafts are a preview, and work after you accept won't be added.") : null,
+    h("div", { class: "toolbar" }, acceptAll, genBtn,
+      h("button", { class: "btn", onclick: () => list.prepend(editForm(day, null)) }, "Add entry"), markSel),
+    list].filter(Boolean));
+
+  if (!day.drafts.length) list.append(h("div", { class: "empty-state" },
+    day.exists ? "No drafts for this day." : day.is_future ? "This day hasn't happened yet."
+      : "No drafts yet. Generate them from your Claude Code activity and Outlook meetings, or add an entry."));
+  for (const d of day.drafts) list.append(card(day, d));
+
+  if (day.not_counted.length) box.append(h("details", { class: "section" },
+    h("summary", {}, `Not counted (${day.not_counted.length})`),
+    h("table", {}, h("tr", {}, h("th", {}, "What"), h("th", {}, "Time"), h("th", {}, "Why"), h("th", {})),
+      day.not_counted.map(n => h("tr", {}, h("td", {}, `${n.kind}: ${n.label}`), h("td", {}, hhmm(Math.round(n.minutes))),
+        h("td", {}, n.reason), h("td", {}, h("button", { class: "btn",
+          onclick: e => e.target.closest("details").after(editForm(day, null, n)) }, "Count this")))))));
+
+  box.append(h("details", { class: "section", open: day.zoho.length > 0 },
+    h("summary", {}, `Already in Zoho (${day.zoho.length})`),
+    day.zoho_error ? h("div", { class: "note" }, day.zoho_error) : null,
+    day.zoho.length ? h("table", {}, h("tr", {}, h("th", {}, "Project"), h("th", {}, "Job"), h("th", {}, "Hours"), h("th", {}, "Description")),
+      day.zoho.map(z => h("tr", {}, h("td", {}, z.project), h("td", {}, z.job), h("td", {}, z.hours), h("td", {}, z.description))))
+      : h("div", { class: "summary" }, "Nothing logged.")));
+}
+const toMin = s => { const [a, b] = String(s).split(":").map(Number); return (a || 0) * 60 + (b || 0); };
+
+function card(day, d) {
+  const isOpen = d.status === "pending" || d.status === "failed";
+  const sources = Object.entries(d.sources || {}).map(([k, v]) => `${k} ${hhmm(Math.round(v))}`).join(" · ");
+  const remaining = d.minutes - (d.zoho_minutes || 0);
+  const el = h("div", { class: "card" + (isOpen ? "" : " done") });
+  const actions = h("div", { class: "actions" });
+  if (isOpen) {
+    const blocked = !d.job_id ? "Pick a job first" : !d.description ? "Add a description first" : null;
+    actions.append(
+      h("button", { class: "btn primary", disabled: !!blocked, title: blocked,
+        onclick: e => withBusy(e.target, "Logging…", async () => {
+          const r = await api("POST", `/api/day/${day.date}/draft/${d.id}/accept`);
+          toast(r.status === "submitted" ? `Logged ${hhmm(r.logged_minutes || r.minutes)} to Zoho`
+              : r.status === "in_zoho" ? "Already in Zoho" : `Failed: ${r.error}`);
+          await refresh(); }) },
+        d.zoho_minutes && remaining > 0 ? `Accept (log ${hhmm(remaining)})` : "Accept"),
+      h("button", { class: "btn", onclick: () => { el.replaceWith(editForm(day, d)); } }, "Edit"),
+      h("button", { class: "btn danger", onclick: e => withBusy(e.target, "…", async () => {
+        await api("POST", `/api/day/${day.date}/draft/${d.id}/decline`); await refresh(); }) }, "Decline"));
+  } else if (d.status === "declined") {
+    actions.append(h("button", { class: "btn", onclick: e => withBusy(e.target, "…", async () => {
+      await api("POST", `/api/day/${day.date}/draft/${d.id}/undo`); await refresh(); }) }, "Undo decline"));
+  }
+  actions.append(h("span", { class: "chip " + d.status }, STATUS_LABEL[d.status] || d.status));
+  if (d.error) actions.append(h("div", { class: "err" }, d.error));
+
+  el.append(...[  // append() would print a null as the text "null"
+    h("div", { class: "top" },
+      h("div", {}, h("div", { class: "proj" }, d.project || "No project"),
+        h("div", { class: "job" + (d.job_id ? "" : " warn") }, d.job_id ? d.job : "Pick a job")),
+      h("div", { class: "hours" }, d.hours)),
+    h("div", { class: "desc" + (d.description ? "" : " empty") }, d.description || "No description yet"),
+    h("div", { class: "meta" }, sources ? h("span", {}, sources) : null,
+      d.suggested ? h("span", { class: "chip suggested", title: "Claude suggested this project — check it" },
+        d.suggested_minutes < d.minutes ? `includes ${hhmm(d.suggested_minutes)} suggested` : "suggested") : null,
+      d.zoho_minutes ? h("span", {}, `Zoho has ${hhmm(d.zoho_minutes)}`) : null,
+      d.job_closed && isOpen ? h("span", { class: "chip failed", title: "Completed, or outside its dates on this day — Zoho may reject it" },
+        "job closed on this day") : null,
+      d.edited ? h("span", {}, "edited") : null, d.manual ? h("span", {}, "added by you") : null),
+    d.items && d.items.length ? h("ul", { class: "items" }, d.items.map(i => h("li", {}, i))) : null,
+    actions].filter(Boolean));
+  return el;
+}
+
+function editForm(day, d, notCounted) {
+  const form = h("form", { class: "card edit" });
+  const projSel = h("select", { required: true }), jobSel = h("select", { required: true });
+  const hours = h("input", { value: d ? d.hours : notCounted ? hhmm(Math.max(15, Math.round(notCounted.minutes / 15) * 15)) : "01:00",
+                             required: true, pattern: "\\d{1,2}:\\d{2}", inputmode: "numeric", "aria-label": "Hours" });
+  const desc = h("textarea", { maxlength: 300, "aria-label": "Description",
+                               placeholder: "What you did, one line" }, d ? d.description : "");
+  const save = h("button", { class: "btn primary", type: "submit" }, "Save");
+  const showAll = h("input", { type: "checkbox", style: "width:auto" });
+  form.append(
+    h("div", { class: "summary" }, d ? "Edit entry" : notCounted ? `Count “${notCounted.label}”` : "New entry"),
+    h("div", { class: "row" }, h("label", {}, "Project", projSel), h("label", {}, "Job", jobSel), h("label", {}, "Hours (HH:MM)", hours)),
+    h("label", { class: "check" }, showAll, `Show all jobs (also completed or outside their dates on ${shortDate(day.date)})`),
+    h("label", {}, "Description", desc),
+    h("div", { class: "actions" }, save, h("button", { class: "btn", type: "button", onclick: render }, "Cancel")));
+
+  let projects = [];
+  const fillJobs = keepJob => {
+    const p = projects.find(p => p.id === projSel.value);
+    jobSel.replaceChildren(h("option", { value: "" }, p ? "Choose…" : "Choose a project first"),
+      ...(p ? p.jobs : []).map(j => h("option", { value: j.id, selected: keepJob === j.id }, j.name)));
+  };
+  const fill = async () => {
+    const keepProject = projSel.value || (d && d.project_id), keepJob = jobSel.value || (d && d.job_id);
+    projects = await loadCatalog(day.date, showAll.checked);
+    // Editing never silently changes a draft's job: keep it listed even if it's closed for this day.
+    if (d && d.job_id && !projects.some(p => p.jobs.some(j => j.id === d.job_id))) {
+      const fp = (await loadCatalog(day.date, true)).find(p => p.id === d.project_id);
+      const fj = fp && fp.jobs.find(j => j.id === d.job_id);
+      if (fj) {
+        const closed = { ...fj, name: fj.name + " (closed on this day)" };
+        projects = projects.some(p => p.id === fp.id)
+          ? projects.map(p => p.id === fp.id ? { ...p, jobs: [closed, ...p.jobs] } : p)
+          : [...projects, { ...fp, jobs: [closed] }];
+      }
+    }
+    projSel.replaceChildren(h("option", { value: "" }, "Choose…"),
+      ...projects.map(p => h("option", { value: p.id, selected: keepProject === p.id }, p.name)));
+    fillJobs(keepJob);
+  };
+  projSel.addEventListener("change", () => fillJobs(null));
+  showAll.addEventListener("change", () => fill().catch(e => toast(e.message)));
+  fill().catch(e => toast(e.message));
+
+  form.addEventListener("submit", e => { e.preventDefault(); withBusy(save, "Saving…", async () => {
+    const body = { project_id: projSel.value, job_id: jobSel.value, hours: hours.value, description: desc.value,
+                   not_counted_id: notCounted ? notCounted.id : undefined };
+    if (d) await api("PUT", `/api/day/${day.date}/draft/${d.id}`, body);
+    else await api("POST", `/api/day/${day.date}/drafts`, body);
+    toast("Saved"); await refresh(); }); });
+  return form;
+}
+
+async function refresh() { await loadDays(); await render(); }
+
+window.addEventListener("hashchange", render);
+document.getElementById("refresh").addEventListener("click", () => { catalogs = {}; refresh().catch(e => toast(e.message)); });
+(async () => {
+  try {
+    await loadDays();
+    if (!location.hash) {
+      const first = days.find(d => d.state === "missed" || d.open) || days[0];
+      selected = first && first.date;
+      if (selected) history.replaceState(null, "", "#" + selected);
+    }
+    await render();
+  } catch (e) {
+    document.getElementById("days").replaceChildren(h("div", { class: "day" }, e.message));
+  }
+})();
+</script>
+</body>
+</html>
