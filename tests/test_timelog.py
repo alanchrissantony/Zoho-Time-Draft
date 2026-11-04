@@ -814,5 +814,84 @@ class ZohoAuthTest(unittest.TestCase):
         self.assertEqual(client.post("/api/auth/disconnect", headers=hdr).json(), {"connected": False})
 
 
+class DaysOffTest(unittest.TestCase):
+    """Leave and holidays from Zoho (fixtures follow the shape of Zoho's documented samples)."""
+    LEAVE = {"records": {
+        "1": {"Unit": "Days", "ApprovalStatus": "Approved", "Leavetype": "Casual Leave",
+              "Days": {"26-Oct-2026": {"LeaveCount": "1.0"}}},
+        "2": {"Unit": "Days", "ApprovalStatus": "Approved", "Leavetype": "Casual Leave",   # half day: still work
+              "Days": {"27-Oct-2026": {"LeaveCount": "0.5", "Session": 1}}},
+        "3": {"Unit": "Hours", "ApprovalStatus": "Approved", "Leavetype": "Permission",
+              "Days": {"22-Oct-2026": {"LeaveCount": "240.0", "Session": 4}}},
+        "4": {"Unit": "Days", "ApprovalStatus": "Pending", "Leavetype": "Casual Leave",
+              "Days": {"21-Oct-2026": {"LeaveCount": "1.0"}}},
+    }}
+    HOLIDAYS = {"status": 1, "message": "Data fetched successfully!", "data": [
+        {"Date": "28-Oct-2026", "Name": "Diwali", "isHalfday": False, "isRestrictedHoliday": False, "Session": 0},
+        {"Date": "23-Oct-2026", "Name": "Half", "isHalfday": True, "isRestrictedHoliday": False, "Session": 1},
+        {"Date": "20-Oct-2026", "Name": "Optional", "isHalfday": False, "isRestrictedHoliday": True, "Session": 0},
+    ]}
+
+    def setUp(self):
+        zoho._days_off_cache.clear()
+
+    def zoho_get(self, leave, holidays):
+        from unittest import mock
+        def get(url, **kw):
+            body = leave if url == zoho.LEAVE_API else holidays
+            if isinstance(body, Exception):
+                raise body
+            return mock.Mock(json=mock.Mock(return_value=body))
+        return mock.patch.object(zoho.requests, "get", side_effect=get)
+
+    def test_full_days_only(self):
+        start = DAY - datetime.timedelta(days=14)
+        with self.zoho_get(self.LEAVE, self.HOLIDAYS) as get:
+            off, note = zoho.days_off(start, DAY, "tok")
+            self.assertEqual((off, note), ({"2026-10-26": "leave", "2026-10-28": "holiday"}, None))
+            leave_call = next(c for c in get.call_args_list if c.args[0] == zoho.LEAVE_API)
+            self.assertEqual({k: leave_call.kwargs["params"][k] for k in ("from", "to", "approvalStatus", "dataSelect")},
+                             {"from": "14-Oct-2026", "to": "28-Oct-2026", "approvalStatus": '["APPROVED"]',
+                              "dataSelect": "MINE"})
+            self.assertEqual(leave_call.kwargs["headers"], {"Authorization": "Zoho-oauthtoken tok"})
+            zoho.days_off(start, DAY, "tok")
+            self.assertEqual(get.call_count, 2)   # cached: Zoho allows 30 calls per 5 minutes
+
+    def test_errors_become_a_note(self):
+        scope = {"response": {"message": "Error occurred", "uri": "/api/v2", "status": 1,     # Zoho's real reply
+                              "errors": {"code": 7218, "message": "Invalid OAuth Scope."}}}   # (no leave access)
+        zoho._days_off_cache.clear()
+        with self.zoho_get(scope, self.HOLIDAYS):
+            self.assertIn("(your Zoho connection has no leave access)", zoho.days_off(DAY, DAY, "tok")[1])
+        cases = [(scope, self.HOLIDAYS),
+                 (self.LEAVE, {"status": 0, "errors": {"code": 7218}}),
+                 (zoho.requests.ConnectionError("offline"), self.HOLIDAYS)]
+        for leave, holidays in cases:
+            zoho._days_off_cache.clear()
+            with self.zoho_get(leave, holidays):
+                off, note = zoho.days_off(DAY, DAY, "tok")
+            self.assertEqual(off, {})
+            self.assertIn("Leave and holidays not read from Zoho", note)
+            self.assertIn("Connect Zoho", note)
+
+    def test_overview_counts_days_off(self):
+        from unittest import mock
+        days_file = {"since": "2026-10-01", "drafts_since": "2026-10-01",
+                     "marks": {"2026-10-23": "holiday", "2026-10-26": "holiday"}}   # yours win over Zoho's
+        with mock.patch.object(dr, "zoho_minutes_by_date", return_value={"2026-10-27": 480}), \
+                mock.patch.object(dr, "load_days_file", return_value=days_file), \
+                mock.patch.object(dr, "load_day", return_value=None), \
+                mock.patch.object(zoho, "days_off", return_value=({"2026-10-26": "leave", "2026-10-22": "leave"},
+                                                                  None)) as days_off:
+            rows = {r["date"]: r for r in dr.overview(DAY, token="tok")}
+        days_off.assert_called_once_with(DAY - datetime.timedelta(days=14), DAY, "tok")
+        pick = lambda d: (rows[d]["state"], rows[d]["off"])
+        self.assertEqual(pick("2026-10-22"), ("leave", "zoho"))
+        self.assertEqual(pick("2026-10-26"), ("holiday", "you"))
+        self.assertEqual(pick("2026-10-23"), ("holiday", "you"))
+        self.assertEqual(pick("2026-10-27"), ("logged", None))
+        self.assertEqual(pick("2026-10-21"), ("missed", None))
+
+
 if __name__ == "__main__":
     unittest.main()

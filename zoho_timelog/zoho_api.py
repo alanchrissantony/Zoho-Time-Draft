@@ -15,8 +15,8 @@ import time
 import requests
 
 from . import oscompat
-from .constants import (CATALOG_TTL, TOKEN_TTL, ZOHO_ACCOUNTS, ZOHO_API, ZOHO_LOG_FILE, ZOHO_TIMEOUT,
-                        ZOHO_TOKEN_FILE)
+from .constants import (CATALOG_TTL, NOTE_CHARS, TOKEN_TTL, ZOHO_ACCOUNTS, ZOHO_API, ZOHO_DOMAIN, ZOHO_LOG_FILE,
+                        ZOHO_TIMEOUT, ZOHO_TOKEN_FILE)
 
 
 class ZohoAPIError(RuntimeError):
@@ -317,6 +317,82 @@ def find_job(project: dict | None, name: str = "", jid: str = "") -> dict | None
         if (jid and j["id"] == str(jid)) or (name and j["name"].strip().lower() == name.strip().lower()):
             return j
     return None
+
+
+# ── Leave and holidays ─────────────────────────────────────────────────────────
+
+LEAVE_API    = f"https://people.{ZOHO_DOMAIN}/api/v2/leavetracker/leaves/records"
+HOLIDAYS_API = f"https://people.{ZOHO_DOMAIN}/people/api/leave/v2/holidays/get"
+_days_off_cache: dict = {}   # (from, to) → (fetched at, result)
+
+
+def _zoho_date(text) -> str | None:
+    """'08-May-2024' (or '2024-05-08') → '2024-05-08'."""
+    for fmt in ("%d-%b-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(str(text).strip(), fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _api_error(what: str, body) -> "ZohoAPIError":
+    """Zoho's error, e.g. {"response": {"errors": {"code": 7218, "message": "Invalid OAuth Scope."}}}, readable."""
+    errors = (body.get("response") or body).get("errors") if isinstance(body, dict) else None
+    if isinstance(errors, dict) and errors.get("code") == 7218:
+        return ZohoAPIError("your Zoho connection has no leave access")
+    text = errors.get("message") if isinstance(errors, dict) else (body.get("message") if isinstance(body, dict) else None)
+    return ZohoAPIError(f"{what}: {str(text or body)[:NOTE_CHARS]}")
+
+
+def _leave_fix() -> str:
+    try:
+        from_env = credentials()["source"] == "env"
+    except NotConnected:
+        from_env = False
+    if from_env:
+        return ("Your ZOHO_* values come from env/config.env/.env: make a new Self Client code with the scope in "
+                "SETUP_GUIDE.md and update ZOHO_REFRESH_TOKEN, or remove them and use Connect Zoho.")
+    return "To fix it, Disconnect and Connect Zoho again in the review app: a new code includes leave access."
+
+
+def days_off(from_date: datetime.date, to_date: datetime.date, tok: str) -> tuple[dict[str, str], str | None]:
+    """Your full days off in Zoho, {"YYYY-MM-DD": "leave" | "holiday"}, plus a note if they couldn't be read.
+
+    Never raises: the missed-day check works without them. Counts approved full-day leave only (a half day
+    or hour-based leave still leaves time to log) and full, non-optional holidays (an optional holiday
+    you take shows up as leave). Cached CATALOG_TTL: both APIs allow only 30 calls per 5 minutes.
+    """
+    key = (from_date, to_date)
+    hit = _days_off_cache.get(key)
+    if hit and time.time() - hit[0] < CATALOG_TTL:
+        return hit[1]
+    dates = {"from": from_date.strftime("%d-%b-%Y"), "to": to_date.strftime("%d-%b-%Y"), "dateFormat": "dd-MMM-yyyy"}
+    headers = {"Authorization": f"Zoho-oauthtoken {tok}"}
+    off: dict[str, str] = {}
+    try:
+        leave = requests.get(LEAVE_API, headers=headers, timeout=ZOHO_TIMEOUT, params={
+            **dates, "approvalStatus": '["APPROVED"]', "dataSelect": "MINE", "limit": 200}).json()
+        if not isinstance(leave.get("records"), dict):
+            raise _api_error("leave", leave)
+        for record in leave["records"].values():
+            if record.get("Unit") != "Days" or str(record.get("ApprovalStatus", "")).lower() != "approved":
+                continue
+            for day, info in (record.get("Days") or {}).items():
+                if float((info or {}).get("LeaveCount") or 0) >= 1 and _zoho_date(day):
+                    off[_zoho_date(day)] = "leave"
+
+        holidays = requests.get(HOLIDAYS_API, params=dates, headers=headers, timeout=ZOHO_TIMEOUT).json()
+        if not isinstance(holidays.get("data"), list):
+            raise _api_error("holidays", holidays)
+        for holiday in holidays["data"]:
+            if not holiday.get("isHalfday") and not holiday.get("isRestrictedHoliday") and _zoho_date(holiday.get("Date")):
+                off[_zoho_date(holiday["Date"])] = "holiday"
+        result = (off, None)
+    except (requests.RequestException, ValueError, TypeError, AttributeError, ZohoAPIError) as exc:
+        result = ({}, f"Leave and holidays not read from Zoho ({_redact(exc)[:NOTE_CHARS]}). {_leave_fix()}")
+    _days_off_cache[key] = (time.time(), result)
+    return result
 
 
 # ── Writes ─────────────────────────────────────────────────────────────────────

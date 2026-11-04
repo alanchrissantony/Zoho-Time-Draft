@@ -601,20 +601,28 @@ def zoho_minutes_by_date(today: datetime.date, token: str, window: int = MISSED_
 
 
 def overview(today: datetime.date, token: str | None = None) -> list[dict]:
-    """The last MISSED_WINDOW days plus today, newest first, for the app's day list."""
+    """The last MISSED_WINDOW days plus today, newest first, for the app's day list.
+
+    Leave and holidays come from Zoho as well as from your own marks; yours win. A row's "off" says
+    where its leave/holiday came from ("zoho" or "you").
+    """
     days_file = load_days_file()
-    logged = zoho_minutes_by_date(today, token or zoho.token())
-    missed = set(missed_days(today, logged, days_file["marks"], days_file["since"]))
+    token = token or zoho.token()
+    logged = zoho_minutes_by_date(today, token)
+    zoho_off, _ = zoho.days_off(today - datetime.timedelta(days=MISSED_WINDOW), today, token)
+    marks = {**zoho_off, **days_file["marks"]}
+    missed = set(missed_days(today, logged, marks, days_file["since"]))
     rows = []
     for back in range(0, MISSED_WINDOW + 1):
         d = today - datetime.timedelta(days=back)
         open_ = sum(x["status"] in OPEN for x in (load_day(d) or {}).get("drafts", []))
-        mark = days_file["marks"].get(d.isoformat())
+        mark = marks.get(d.isoformat())
         state = ("today" if back == 0 else mark if mark else "missed" if d in missed
                  else "review" if open_ else "logged" if logged.get(d.isoformat())
                  else "weekend" if d.weekday() >= 5 else "none")
+        off = "you" if d.isoformat() in days_file["marks"] else "zoho" if d.isoformat() in zoho_off else None
         rows.append({"date": d.isoformat(), "weekday": d.strftime("%a"), "state": state,
-                     "zoho_minutes": logged.get(d.isoformat(), 0), "open": open_})
+                     "zoho_minutes": logged.get(d.isoformat(), 0), "open": open_, "off": off})
     return rows
 
 

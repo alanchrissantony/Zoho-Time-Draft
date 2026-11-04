@@ -35,8 +35,8 @@ from . import drafts as dr
 from . import scheduler
 from . import zoho_api as zoho
 from .constants import (APP_LOG, APP_URL, CLAUDE_SETTINGS, CONFIG_FILE, DRAFTS_DIR, EXAMPLE_CONFIG,
-                        EXAMPLE_PROJECTS, HOST, MCP_LIST_TIMEOUT, NOTE_CHARS, OLD_HOOK_FILE, OLD_MCP_NAME, PORT,
-                        PROJECTS_FILE, TIMELOG_DIR, ZOHO_CONSOLE, ZOHO_SCOPES)
+                        EXAMPLE_PROJECTS, HOST, MCP_LIST_TIMEOUT, MISSED_WINDOW, NOTE_CHARS, OLD_HOOK_FILE,
+                        OLD_MCP_NAME, PORT, PROJECTS_FILE, TIMELOG_DIR, ZOHO_CONSOLE, ZOHO_SCOPES)
 from .oscompat import IS_MAC, IS_WINDOWS, run
 from .sources import claude_cmd, load_activity, load_mapping
 
@@ -313,6 +313,11 @@ def cmd_doctor(args) -> None:
     status = zoho.auth_status()
     source = "ZOHO_* values in env/config.env/.env" if status.get("source") == "env" else "Connect Zoho"
     check(zoho_error is None, f"Zoho: signed in as {status.get('user') or '?'} ({source})", f"Zoho: {zoho_error}")
+    if zoho_error is None:
+        today = datetime.date.today()
+        off, note = zoho.days_off(today - datetime.timedelta(days=MISSED_WINDOW), today, zoho.token())
+        check(note is None, f"Zoho leave and holidays readable ({len(off)} day(s) off in the last {MISSED_WINDOW} days)",
+              note or "")
 
     if os.getenv("TIMELOG_MEETINGS", "1") == "0":
         print("     Outlook meetings are off (TIMELOG_MEETINGS=0)")
@@ -355,6 +360,8 @@ def cmd_status(args) -> None:
         return
     missed = [r["date"] for r in rows if r["state"] == "missed"]
     review = [f"{r['date']} ({r['open']})" for r in rows if r["open"]]
+    off = [f"{r['date']} ({r['state']}{', from Zoho' if r['off'] == 'zoho' else ''})" for r in rows if r["off"]]
+    print(f"Leave and holidays: {', '.join(off) or 'none'}")
     print(f"Missed weekdays: {', '.join(missed) or 'none'}")
     print(f"Drafts to review: {', '.join(review) or 'none'}")
 
