@@ -91,6 +91,8 @@ Delete `~/.timelog` as well if you want your drafts, logs and Zoho connection go
    - **Decline** drops it (Undo brings it back).
 4. Day buttons: **Accept all**, **Regenerate** (also works for today as a preview), **Add entry**
    for time nothing captured, and **Mark day as leave / holiday** so it stops counting as missed.
+   Full-day leave you've booked and your holidays in Zoho are picked up by themselves ("Leave in Zoho");
+   half days aren't, as there's still time to log.
 
 "Not counted" lists what was left out (personal events like farewells, meetings Claude couldn't
 place, ignored repos); **Count this** turns one into an entry. "Already in Zoho" shows that day's

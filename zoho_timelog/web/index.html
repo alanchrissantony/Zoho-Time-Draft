@@ -259,6 +259,9 @@ async function render() {
     h("option", { value: "" }, day.mark ? "Clear mark" : "Mark day as…"),
     h("option", { value: "leave", selected: day.mark === "leave" }, "Leave"),
     h("option", { value: "holiday", selected: day.mark === "holiday" }, "Holiday"));
+  // Leave or a holiday booked in Zoho: shown, not editable here (change it in Zoho)
+  const offInZoho = row && row.off === "zoho"
+    ? h("span", { class: "chip " + row.state }, `${row.state === "holiday" ? "Holiday" : "Leave"} in Zoho`) : null;
 
   const list = h("div");
   box.replaceChildren(...[
@@ -270,7 +273,7 @@ async function render() {
     ...day.notes.map(n => h("div", { class: "note" }, n)),
     day.is_today ? h("div", { class: "note" }, "Today isn't over: drafts are a preview, and work after you accept won't be added.") : null,
     h("div", { class: "toolbar" }, acceptAll, genBtn,
-      h("button", { class: "btn", onclick: () => list.prepend(editForm(day, null)) }, "Add entry"), markSel),
+      h("button", { class: "btn", onclick: () => list.prepend(editForm(day, null)) }, "Add entry"), offInZoho || markSel),
     list].filter(Boolean));
 
   if (!day.drafts.length) list.append(h("div", { class: "empty-state" },
