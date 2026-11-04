@@ -1,7 +1,9 @@
 name: CI
 
 on:
+  # A PR's commits are tested once, by pull_request; pushes test only the protected branches
   push:
+    branches: [main, develop]
   pull_request:
   workflow_dispatch:   # "Run workflow" on the Actions page, e.g. when macOS runners were too busy
 
