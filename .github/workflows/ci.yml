@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  # A PR's commits are tested once, by pull_request; pushes test only the protected branches
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:   # "Run workflow" on the Actions page, e.g. when macOS runners were too busy
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.13"]
+        exclude:   # macOS runners are scarce; one Python there leaves one free for the install job
+          - os: macos-latest
+            python: "3.11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3   # no floating major tag since v10
+      - name: Git identity
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+      - name: Unit tests
+        shell: bash
+        run: |
+          set +e
+          uv run --python ${{ matrix.python }} --group dev python -m unittest discover -v tests > test-output.txt 2>&1
+          status=$?
+          cat test-output.txt
+          # Failures as annotations: readable on the run page without logging in
+          [ $status -eq 0 ] || uv run --no-project python tests/gh_annotate.py test-output.txt
+          exit $status
+
+  install:
+    # A teammate's path: install the tool, `timelog install`, a prompt through the hook, uninstall
+    name: install, hook, uninstall (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+      - name: Git identity
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name CI
+      - name: Install the tool
+        run: uv tool install --python 3.12 .
+      - name: Put uv's tool folder on PATH
+        shell: bash
+        run: uv tool dir --bin >> "$GITHUB_PATH"
+      - name: Install, use the hook, uninstall
+        run: uv run --no-project --python 3.12 python tests/smoke_install.py

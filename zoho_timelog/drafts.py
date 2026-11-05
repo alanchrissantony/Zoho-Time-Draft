@@ -6,30 +6,27 @@
     submit(day, id)     logs one accepted draft (only the time Zoho doesn't already have)
     missed_days(...)    weekdays with nothing in Zoho → notify()
 
-The review app (review_app.py) and the CLI (timelog.py) are thin layers over these.
+The review app (review_app.py) and the CLI (cli.py) are thin layers over these.
 """
 
 import contextlib
 import datetime
 import difflib
-import fcntl
 import json
 import math
-import os
 import re
-import shutil
-import subprocess
 import time
 import uuid
 from pathlib import Path
 
-import zoho_api as zoho
-from constants import (APP_URL, BACKLOG_DAYS, DAY_MINUTES, DAYS_FILE, DRAFTS_DIR, ERROR_CHARS, GAP_MIN,
+from . import oscompat
+from . import zoho_api as zoho
+from .constants import (APP_URL, BACKLOG_DAYS, DAY_MINUTES, DAYS_FILE, DRAFTS_DIR, ERROR_CHARS, GAP_MIN,
                        GEN_LOCK, GEN_LOCK_STALE, MARKS, MAX_PROMPTS, MISSED_WINDOW, NOTE_CHARS, OPEN,
                        PROMPT_FILE, ROUND_MIN, RUN_LOG, TAIL_MIN, TIMELOG_DIR)
-from sources import (CLAUDE_ERRORS, day_bounds, git_commits, load_activity, load_mapping, outlook_meetings,
+from .sources import (CLAUDE_ERRORS, day_bounds, git_commits, load_activity, load_mapping, outlook_meetings,
                      run_claude)
-from zoho_api import find_job, find_project, log_minutes, open_catalog
+from .zoho_api import find_job, find_project, log_minutes, open_catalog
 
 
 # ── Time math (pure) ───────────────────────────────────────────────────────────
@@ -334,7 +331,7 @@ def claude_payload(day: datetime.date, timeline: dict, catalog: list[dict]) -> d
 
 def ask_claude(payload: dict) -> dict:
     """Headless Claude, no tools and no MCP servers. Returns answers keyed by id."""
-    prompt = PROMPT_FILE.read_text() + "\n\n```json\n" + json.dumps(payload, indent=1) + "\n```\n"
+    prompt = PROMPT_FILE.read_text(encoding="utf-8") +"\n\n```json\n" + json.dumps(payload, indent=1) + "\n```\n"
     reply = run_claude(prompt, DRAFT_SCHEMA)
     return {"entries": {a["id"]: a for a in reply.get("entries", [])},
             "buckets": {a["id"]: a for a in reply.get("buckets", [])}}
@@ -348,7 +345,7 @@ def day_path(day: datetime.date) -> Path:
 
 def load_day(day: datetime.date) -> dict | None:
     path = day_path(day)
-    return json.loads(path.read_text()) if path.exists() else None
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
 
 def empty_day(day: datetime.date) -> dict:
@@ -359,20 +356,13 @@ def empty_day(day: datetime.date) -> dict:
 def _write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, default=str))
-    os.replace(tmp, path)
+    tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+    oscompat.replace(tmp, path)
 
 
-@contextlib.contextmanager
 def day_lock(day: datetime.date):
-    """Exclusive lock for one day's draft file (app, CLI and launchd all go through it)."""
-    DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(DRAFTS_DIR / f".{day.isoformat()}.lock", "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    """Exclusive lock for one day's draft file (app, CLI and the scheduler all go through it)."""
+    return oscompat.file_lock(DRAFTS_DIR / f".{day.isoformat()}.lock")
 
 
 def update_day(day: datetime.date, fn) -> dict:
@@ -564,7 +554,7 @@ def accept_all(day: datetime.date) -> list[dict]:
 # ── Days: marks, missed, overview ──────────────────────────────────────────────
 
 def load_days_file() -> dict:
-    data = json.loads(DAYS_FILE.read_text()) if DAYS_FILE.exists() else {}
+    data = json.loads(DAYS_FILE.read_text(encoding="utf-8")) if DAYS_FILE.exists() else {}
     return {"since": data.get("since"), "drafts_since": data.get("drafts_since"), "marks": data.get("marks", {})}
 
 
@@ -611,20 +601,28 @@ def zoho_minutes_by_date(today: datetime.date, token: str, window: int = MISSED_
 
 
 def overview(today: datetime.date, token: str | None = None) -> list[dict]:
-    """The last MISSED_WINDOW days plus today, newest first, for the app's day list."""
+    """The last MISSED_WINDOW days plus today, newest first, for the app's day list.
+
+    Leave and holidays come from Zoho as well as from your own marks; yours win. A row's "off" says
+    where its leave/holiday came from ("zoho" or "you").
+    """
     days_file = load_days_file()
-    logged = zoho_minutes_by_date(today, token or zoho.token())
-    missed = set(missed_days(today, logged, days_file["marks"], days_file["since"]))
+    token = token or zoho.token()
+    logged = zoho_minutes_by_date(today, token)
+    zoho_off, _ = zoho.days_off(today - datetime.timedelta(days=MISSED_WINDOW), today, token)
+    marks = {**zoho_off, **days_file["marks"]}
+    missed = set(missed_days(today, logged, marks, days_file["since"]))
     rows = []
     for back in range(0, MISSED_WINDOW + 1):
         d = today - datetime.timedelta(days=back)
         open_ = sum(x["status"] in OPEN for x in (load_day(d) or {}).get("drafts", []))
-        mark = days_file["marks"].get(d.isoformat())
+        mark = marks.get(d.isoformat())
         state = ("today" if back == 0 else mark if mark else "missed" if d in missed
                  else "review" if open_ else "logged" if logged.get(d.isoformat())
                  else "weekend" if d.weekday() >= 5 else "none")
+        off = "you" if d.isoformat() in days_file["marks"] else "zoho" if d.isoformat() in zoho_off else None
         rows.append({"date": d.isoformat(), "weekday": d.strftime("%a"), "state": state,
-                     "zoho_minutes": logged.get(d.isoformat(), 0), "open": open_})
+                     "zoho_minutes": logged.get(d.isoformat(), 0), "open": open_, "off": off})
     return rows
 
 
@@ -659,17 +657,9 @@ def notification_text(missed: list[datetime.date], to_review: int) -> str | None
 
 
 def notify(message: str, open_date: datetime.date | None = None) -> None:
-    """macOS notification; with terminal-notifier a click opens the review app on that date."""
+    """Desktop notification; where the OS allows, a click opens the review app on that date."""
     url = APP_URL + (f"/#{open_date.isoformat()}" if open_date else "/")
-    notifier = shutil.which("terminal-notifier") or next(
-        (p for p in ("/usr/local/bin/terminal-notifier", "/opt/homebrew/bin/terminal-notifier") if Path(p).exists()), None)
-    if notifier:
-        subprocess.run([notifier, "-title", "Zoho time log", "-message", message, "-open", url,
-                        "-group", "timelog"], capture_output=True)
-    elif shutil.which("osascript"):
-        subprocess.run(["osascript", "-e", "on run argv", "-e",
-                        'display notification (item 1 of argv) with title "Zoho time log"',
-                        "-e", "end run", f"{message} — open {url}"], capture_output=True)
+    oscompat.notify("Zoho time log", message, url)
 
 
 def write_run_log(data: dict) -> None:
@@ -697,6 +687,6 @@ def log_action(day: datetime.date, d: dict) -> None:
 
 def _append_log(text: str) -> None:
     TIMELOG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(RUN_LOG, "a") as f:
+    with open(RUN_LOG, "a", encoding="utf-8") as f:
         f.write(text + "\n")
     print(text)

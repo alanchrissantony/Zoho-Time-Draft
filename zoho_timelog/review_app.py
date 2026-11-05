@@ -1,6 +1,6 @@
 """Review app: accept, edit or decline draft time logs before they reach Zoho.
 
-Runs on 127.0.0.1 only (`python timelog.py app`, or the launchd agent). Requests must carry an
+Runs on 127.0.0.1 only (`timelog app`, or the launchd agent). Requests must carry an
 allowed Host header (blocks DNS rebinding), and every write needs `X-Timelog: 1`, which a
 cross-site form can't send without a CORS preflight that this app never allows.
 """
@@ -15,9 +15,9 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
-import drafts as dr
-import zoho_api as zoho
-from constants import ERROR_CHARS, HOST, INDEX_HTML, PORT
+from . import drafts as dr
+from . import zoho_api as zoho
+from .constants import ERROR_CHARS, HOST, INDEX_HTML, PORT, ZOHO_CONSOLE, ZOHO_SCOPES
 
 CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
@@ -45,6 +45,8 @@ def api(fn):
             return JSONResponse({"error": str(exc).strip("'\"")}, status_code=400)
         except dr.Busy as exc:
             return JSONResponse({"error": str(exc)}, status_code=409)
+        except zoho.NotConnected as exc:   # the page shows Connect Zoho
+            return JSONResponse({"error": str(exc), "connect": True}, status_code=401)
         except Exception as exc:  # Zoho / Claude / network
             return JSONResponse({"error": f"{type(exc).__name__}: {str(exc)[:ERROR_CHARS]}"}, status_code=502)
     return endpoint
@@ -122,6 +124,25 @@ def mark(request, body):
     return {"ok": True}
 
 
+def auth(request, body):
+    """Connected or not, plus what the Connect Zoho form shows."""
+    return {**zoho.auth_status(), "console_url": ZOHO_CONSOLE, "scopes": ZOHO_SCOPES}
+
+
+def auth_connect(request, body):
+    email = zoho.connect(body.get("client_id", ""), body.get("client_secret", ""), body.get("code", ""),
+                         body.get("email", ""))
+    return {"connected": True, "user": email}
+
+
+def auth_disconnect(request, body):
+    if zoho.auth_status().get("source") == "env":
+        raise ValueError("These credentials come from ZOHO_* values in your environment, config.env or .env; "
+                         "remove them there")
+    zoho.disconnect()
+    return {"connected": False}
+
+
 # ── App ────────────────────────────────────────────────────────────────────────
 
 def make_app(port: int = PORT) -> Starlette:
@@ -154,6 +175,9 @@ def make_app(port: int = PORT) -> Starlette:
             Route(d + "/accept-all", api(accept_all), methods=["POST"]),
             Route(d + "/regenerate", api(regenerate), methods=["POST"]),
             Route(d + "/mark", api(mark), methods=["POST"]),
+            Route("/api/auth", api(auth)),
+            Route("/api/auth/connect", api(auth_connect), methods=["POST"]),
+            Route("/api/auth/disconnect", api(auth_disconnect), methods=["POST"]),
         ],
         middleware=[Middleware(BaseHTTPMiddleware, dispatch=guard)],
     )

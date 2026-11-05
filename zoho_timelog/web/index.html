@@ -123,13 +123,28 @@
            transition: .2s; pointer-events: none; overflow-wrap: anywhere; }
   .toast.show { opacity: 1; transform: none; }
   .spin { color: var(--muted); }
+
+  [hidden] { display: none !important; }   /* main is display: grid, which would beat the attribute */
+  header .end { display: flex; align-items: center; gap: 12px; }
+  .zoho { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  button.link { font: inherit; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer; }
+  #connect { max-width: 640px; margin: 24px auto; }
+  @media (max-width: 760px) { #connect { margin: 16px; } }
+  #connect h2 { font-size: 16px; margin: 0; }
+  #connect p { color: var(--muted); margin: 4px 0 0; }
+  #connect ol { margin: 6px 0 2px; padding-left: 20px; display: grid; gap: 8px; }
+  #connect code { font-size: 12px; background: var(--gray-soft); padding: 2px 6px; border-radius: 5px;
+                  overflow-wrap: anywhere; }
+  #connect a { color: var(--accent); }
+  #connect .err { color: var(--red); overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
 <header>
   <div><h1>Zoho time log</h1><div class="sub" id="sub">Review drafts before they reach Zoho</div></div>
-  <button class="btn" id="refresh" title="Reload">Reload</button>
+  <div class="end"><span class="zoho" id="zoho"></span><button class="btn" id="refresh" title="Reload">Reload</button></div>
 </header>
+<section class="card" id="connect" hidden></section>
 <main>
   <nav class="days" id="days" aria-label="Days"><div class="day spin">Loading…</div></nav>
   <section class="detail" id="detail"></section>
@@ -167,6 +182,7 @@ async function api(method, path, body) {
                                   body: body === undefined ? undefined : JSON.stringify(body) });
   let data = {};
   try { data = await res.json(); } catch { /* non-JSON error */ }
+  if (res.status === 401 && data.connect) loadAuth().catch(() => {});   // shows Connect Zoho
   if (!res.ok) throw new Error(data.error || `${res.status} ${res.statusText}`);
   return data;
 }
@@ -243,6 +259,9 @@ async function render() {
     h("option", { value: "" }, day.mark ? "Clear mark" : "Mark day as…"),
     h("option", { value: "leave", selected: day.mark === "leave" }, "Leave"),
     h("option", { value: "holiday", selected: day.mark === "holiday" }, "Holiday"));
+  // Leave or a holiday booked in Zoho: shown, not editable here (change it in Zoho)
+  const offInZoho = row && row.off === "zoho"
+    ? h("span", { class: "chip " + row.state }, `${row.state === "holiday" ? "Holiday" : "Leave"} in Zoho`) : null;
 
   const list = h("div");
   box.replaceChildren(...[
@@ -254,7 +273,7 @@ async function render() {
     ...day.notes.map(n => h("div", { class: "note" }, n)),
     day.is_today ? h("div", { class: "note" }, "Today isn't over: drafts are a preview, and work after you accept won't be added.") : null,
     h("div", { class: "toolbar" }, acceptAll, genBtn,
-      h("button", { class: "btn", onclick: () => list.prepend(editForm(day, null)) }, "Add entry"), markSel),
+      h("button", { class: "btn", onclick: () => list.prepend(editForm(day, null)) }, "Add entry"), offInZoho || markSel),
     list].filter(Boolean));
 
   if (!day.drafts.length) list.append(h("div", { class: "empty-state" },
@@ -377,10 +396,64 @@ function editForm(day, d, notCounted) {
 
 async function refresh() { await loadDays(); await render(); }
 
+// ── Zoho connection: your own Self Client, set up once ──
+let auth = {};
+async function loadAuth() {
+  auth = await api("GET", "/api/auth");
+  document.getElementById("zoho").replaceChildren(!auth.connected ? "" : h("span", {},
+    `Zoho: ${auth.user || "connected"}`,
+    auth.source === "file" ? [" · ", h("button", { class: "link", onclick: disconnectZoho }, "Disconnect")] : null));
+  document.getElementById("connect").hidden = auth.connected;
+  document.querySelector("main").hidden = !auth.connected;
+  if (!auth.connected) renderConnect();
+  return auth.connected;
+}
+
+function renderConnect() {
+  const field = (label, attrs) => { const el = h("input", { autocomplete: "off", spellcheck: "false", ...attrs });
+                                    return [h("label", {}, label, el), el]; };
+  const [idLabel, id] = field("Client ID", { required: true, placeholder: "1000.…" });
+  const [secretLabel, secret] = field("Client Secret", { required: true, type: "password" });
+  const [codeLabel, code] = field("Code", { required: true, placeholder: "1000.…" });
+  const [emailLabel, email] = field("Your Zoho email (only if asked)", { type: "email" });
+  const submit = h("button", { class: "btn primary", type: "submit" }, "Connect");
+  const err = h("div", { class: "err", role: "alert" });
+  const copy = h("button", { class: "btn", type: "button", onclick: () =>
+    navigator.clipboard.writeText(auth.scopes).then(() => toast("Scope copied"), () => toast("Select and copy it")) }, "Copy");
+  const form = h("form", { class: "edit" },
+    h("div", {}, h("h2", {}, "Connect Zoho"),
+      h("p", {}, "Time is logged as you, through your own Zoho API client. One-time setup, about two minutes; " +
+                 "the keys stay on this computer.")),
+    h("ol", {},
+      h("li", {}, "Open the ", h("a", { href: auth.console_url, target: "_blank", rel: "noopener" }, "Zoho API Console"),
+        " and choose ", h("b", {}, "Self Client"), " (create one if asked). On its ", h("b", {}, "Client Secret"),
+        " tab, copy the Client ID and Client Secret into the fields below."),
+      h("li", {}, "On the ", h("b", {}, "Generate Code"), " tab, paste this scope, choose 10 minutes, type any " +
+        "description and press Create:", h("div", { class: "actions" }, h("code", {}, auth.scopes), copy)),
+      h("li", {}, "Copy the code Zoho shows into the Code field and press Connect.")),
+    idLabel, secretLabel, codeLabel, emailLabel,
+    h("div", { class: "actions" }, submit), err);
+  form.addEventListener("submit", e => { e.preventDefault(); err.textContent = "";
+    withBusy(submit, "Connecting…", async () => {
+      try {
+        const r = await api("POST", "/api/auth/connect",
+          { client_id: id.value, client_secret: secret.value, code: code.value, email: email.value });
+        toast(`Connected as ${r.user}`); await start();
+      } catch (e) { err.textContent = e.message; }
+    }); });
+  document.getElementById("connect").replaceChildren(form);
+}
+
+async function disconnectZoho() {
+  if (!confirm("Disconnect Zoho? Your drafts stay. To connect again you'll need a new code from your Self Client.")) return;
+  try { await api("POST", "/api/auth/disconnect"); await start(); } catch (e) { toast(e.message); }
+}
+
 window.addEventListener("hashchange", render);
 document.getElementById("refresh").addEventListener("click", () => { catalogs = {}; refresh().catch(e => toast(e.message)); });
-(async () => {
+async function start() {
   try {
+    if (!(await loadAuth())) return;
     await loadDays();
     if (!location.hash) {
       const first = days.find(d => d.state === "missed" || d.open) || days[0];
@@ -391,7 +464,8 @@ document.getElementById("refresh").addEventListener("click", () => { catalogs = 
   } catch (e) {
     document.getElementById("days").replaceChildren(h("div", { class: "day" }, e.message));
   }
-})();
+}
+start();
 </script>
 </body>
 </html>

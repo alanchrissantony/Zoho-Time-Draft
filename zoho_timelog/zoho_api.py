@@ -1,11 +1,12 @@
 """Zoho People Timetracker API: the one place that talks to Zoho.
 
-Config, auth (cached token), reads (projects, jobs, time logs), the job catalog (which jobs
-are open on a day), adding a time log, and time helpers. Used by the draft job (drafts.py)
-and the review app.
+Auth (your own Self Client, cached token), reads (projects, jobs, time logs), the job catalog
+(which jobs are open on a day), adding a time log, and time helpers. Used by the draft job
+(drafts.py) and the review app.
 """
 
 import datetime
+import json
 import os
 import re
 import sys
@@ -13,17 +14,17 @@ import time
 
 import requests
 
-from constants import CATALOG_TTL, TOKEN_TTL, ZOHO_API, ZOHO_DOMAIN, ZOHO_LOG_FILE, ZOHO_TIMEOUT
-
-# Credentials and identity (constants has loaded .env)
-CLIENT_ID     = os.getenv("ZOHO_CLIENT_ID")
-CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
-REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
-USER          = os.getenv("ZOHO_USER")
+from . import oscompat
+from .constants import (CATALOG_TTL, NOTE_CHARS, TOKEN_TTL, ZOHO_ACCOUNTS, ZOHO_API, ZOHO_DOMAIN, ZOHO_LOG_FILE,
+                        ZOHO_TIMEOUT, ZOHO_TOKEN_FILE)
 
 
 class ZohoAPIError(RuntimeError):
     """Raised by strict API reads when Zoho returns an error response."""
+
+
+class NotConnected(RuntimeError):
+    """No Zoho credentials yet: Connect Zoho in the review app (or `timelog login`) sets them up."""
 
 
 # ── Time helpers ───────────────────────────────────────────────────────────────
@@ -58,27 +59,67 @@ def log_minutes(log: dict) -> int:
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
+#
+# Everyone uses their own Zoho Self Client (api-console.zoho.in). Connect Zoho in the review app
+# exchanges its Client ID, Client Secret and a one-time code for a refresh token and saves them
+# in ~/.timelog/zoho_token.json. ZOHO_* values in the environment, config.env or a checkout's .env
+# take precedence (developer setups).
 
 _SECRET_RE = re.compile(r"((?:refresh_token|client_secret|client_id|access_token|code)=)[^&\s'\"]+")
 _token_cache: dict = {"at": 0.0, "token": None}
+NOT_CONNECTED = "Zoho isn't connected: open the review app and click Connect Zoho (or run `timelog login`)"
+
+
+def credentials() -> dict:
+    """{client_id, client_secret, refresh_token, user, accounts_server, source: "env"|"file"}.
+    Read on every call, so a connection made in the app applies at once. Raises NotConnected."""
+    if os.getenv("ZOHO_REFRESH_TOKEN"):
+        return {"client_id": os.getenv("ZOHO_CLIENT_ID"), "client_secret": os.getenv("ZOHO_CLIENT_SECRET"),
+                "refresh_token": os.getenv("ZOHO_REFRESH_TOKEN"), "user": os.getenv("ZOHO_USER"),
+                "accounts_server": ZOHO_ACCOUNTS, "source": "env"}
+    try:
+        saved = json.loads(ZOHO_TOKEN_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise NotConnected(NOT_CONNECTED) from None
+    if not saved.get("refresh_token"):
+        raise NotConnected(NOT_CONNECTED)
+    return {"accounts_server": ZOHO_ACCOUNTS, **saved, "source": "file"}
+
+
+def user() -> str | None:
+    """Your Zoho email, which the People API calls `user`."""
+    return credentials().get("user")
+
+
+def auth_status() -> dict:
+    try:
+        creds = credentials()
+    except NotConnected:
+        return {"connected": False}
+    return {"connected": True, "user": creds.get("user"), "source": creds["source"]}
 
 
 def _redact(text) -> str:
     """Mask credentials in anything we print (exception texts can contain request URLs)."""
     text = _SECRET_RE.sub(r"\1***", str(text))
-    for secret in (REFRESH_TOKEN, CLIENT_SECRET, CLIENT_ID):
-        if secret:
-            text = text.replace(secret, "***")
+    try:
+        creds = credentials()
+    except NotConnected:
+        return text
+    for key in ("refresh_token", "client_secret", "client_id"):
+        if creds.get(key):
+            text = text.replace(creds[key], "***")
     return text
 
 
 def get_access_token() -> str | None:
     """A fresh access token from the refresh token, or None (reason printed to stderr)."""
+    creds = credentials()
     # Credentials go in the POST body, never the URL: URLs end up in exception texts and logs.
-    body = {"refresh_token": REFRESH_TOKEN, "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET, "grant_type": "refresh_token"}
+    body = {"refresh_token": creds["refresh_token"], "client_id": creds["client_id"],
+            "client_secret": creds["client_secret"], "grant_type": "refresh_token"}
     try:
-        data = requests.post(f"https://accounts.{ZOHO_DOMAIN}/oauth/v2/token", data=body,
+        data = requests.post(f"{creds['accounts_server']}/oauth/v2/token", data=body,
                              timeout=ZOHO_TIMEOUT).json()
     except Exception as e:
         print(f"Token fetch failed: {type(e).__name__}: {_redact(e)}", file=sys.stderr)
@@ -89,14 +130,66 @@ def get_access_token() -> str | None:
 
 
 def token() -> str:
-    """Cached access token; raises RuntimeError if Zoho won't give one."""
+    """Cached access token. Raises NotConnected without credentials, RuntimeError if Zoho refuses them."""
     if _token_cache["token"] and time.time() - _token_cache["at"] < TOKEN_TTL:
         return _token_cache["token"]
     tok = get_access_token()
     if not tok:
-        raise RuntimeError("Zoho auth failed: check the refresh token in .env")
+        where = ("the ZOHO_* values in your environment, config.env or .env" if credentials()["source"] == "env"
+                 else "your connection: Disconnect and Connect Zoho again in the review app")
+        raise RuntimeError(f"Zoho auth failed: check {where}")
     _token_cache.update(at=time.time(), token=tok)
     return tok
+
+
+_CONNECT_ERRORS = {
+    "invalid_code": "That code has expired or was already used. Generate a new one (Self Client → Generate Code) "
+                    "and paste it again.",
+    "invalid_client": "Zoho doesn't recognise that Client ID. Copy it again from Self Client → Client Secret.",
+    "invalid_client_secret": "That Client Secret doesn't match the Client ID. Copy both again from Self Client → "
+                             "Client Secret.",
+}
+
+
+def connect(client_id: str, client_secret: str, code: str, email: str = "") -> str:
+    """Exchange your Self Client's one-time code for a refresh token and save the connection.
+    Returns your Zoho email. ValueError (with what to do) for anything you can fix."""
+    client_id, client_secret, code, email = (v.strip() for v in (client_id, client_secret, code, email or ""))
+    if not (client_id and client_secret and code):
+        raise ValueError("Paste the Client ID, the Client Secret and the code")
+    body = {"grant_type": "authorization_code", "client_id": client_id, "client_secret": client_secret, "code": code}
+    data = requests.post(f"{ZOHO_ACCOUNTS}/oauth/v2/token", data=body, timeout=ZOHO_TIMEOUT).json()
+    if data.get("error") or not data.get("refresh_token"):
+        error = data.get("error") or "no refresh token in the reply"
+        raise ValueError(_CONNECT_ERRORS.get(error, f"Zoho refused the code ({error}). Generate a new one and try again."))
+    if not email:
+        try:
+            info = requests.get(f"{ZOHO_ACCOUNTS}/oauth/user/info", timeout=ZOHO_TIMEOUT,
+                                headers={"Authorization": f"Zoho-oauthtoken {data['access_token']}"}).json()
+            email = info.get("Email") or info.get("email") or ""
+        except (requests.RequestException, ValueError):
+            email = ""
+    if not email:
+        raise ValueError("Zoho didn't share your email (is AaaServer.profile.Read in the code's scope?). Type your "
+                         "Zoho email in the form and connect again with a new code.")
+    saved = {"client_id": client_id, "client_secret": client_secret, "refresh_token": data["refresh_token"],
+             "user": email, "accounts_server": ZOHO_ACCOUNTS}
+    ZOHO_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ZOHO_TOKEN_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+    os.chmod(tmp, 0o600)   # only you can read it (Windows: your profile folder is already private)
+    oscompat.replace(tmp, ZOHO_TOKEN_FILE)
+    _token_cache.update(at=time.time(), token=data["access_token"])
+    return email
+
+
+def disconnect() -> bool:
+    """Forget the saved connection. False if there was none (or the credentials come from env/.env)."""
+    _token_cache.update(at=0.0, token=None)
+    if ZOHO_TOKEN_FILE.exists():
+        ZOHO_TOKEN_FILE.unlink()
+        return True
+    return False
 
 
 # ── Reads ──────────────────────────────────────────────────────────────────────
@@ -138,7 +231,7 @@ def fetch_existing_logs(work_date: datetime.date, tok: str, strict: bool = False
 
 def fetch_logs_range(from_date: datetime.date, to_date: datetime.date, tok: str, strict: bool = False) -> list:
     """Time logs from from_date to to_date inclusive; each has workDate as YYYY-MM-DD."""
-    params = {"user": USER, "fromDate": from_date.isoformat(), "toDate": to_date.isoformat(),
+    params = {"user": user(), "fromDate": from_date.isoformat(), "toDate": to_date.isoformat(),
               "dateFormat": "yyyy-MM-dd"}
     try:
         r = requests.get(f"{ZOHO_API}/gettimelogs", params=params, timeout=ZOHO_TIMEOUT,
@@ -226,6 +319,82 @@ def find_job(project: dict | None, name: str = "", jid: str = "") -> dict | None
     return None
 
 
+# ── Leave and holidays ─────────────────────────────────────────────────────────
+
+LEAVE_API    = f"https://people.{ZOHO_DOMAIN}/api/v2/leavetracker/leaves/records"
+HOLIDAYS_API = f"https://people.{ZOHO_DOMAIN}/people/api/leave/v2/holidays/get"
+_days_off_cache: dict = {}   # (from, to) → (fetched at, result)
+
+
+def _zoho_date(text) -> str | None:
+    """'08-May-2024' (or '2024-05-08') → '2024-05-08'."""
+    for fmt in ("%d-%b-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(str(text).strip(), fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _api_error(what: str, body) -> "ZohoAPIError":
+    """Zoho's error, e.g. {"response": {"errors": {"code": 7218, "message": "Invalid OAuth Scope."}}}, readable."""
+    errors = (body.get("response") or body).get("errors") if isinstance(body, dict) else None
+    if isinstance(errors, dict) and errors.get("code") == 7218:
+        return ZohoAPIError("your Zoho connection has no leave access")
+    text = errors.get("message") if isinstance(errors, dict) else (body.get("message") if isinstance(body, dict) else None)
+    return ZohoAPIError(f"{what}: {str(text or body)[:NOTE_CHARS]}")
+
+
+def _leave_fix() -> str:
+    try:
+        from_env = credentials()["source"] == "env"
+    except NotConnected:
+        from_env = False
+    if from_env:
+        return ("Your ZOHO_* values come from env/config.env/.env: make a new Self Client code with the scope in "
+                "SETUP_GUIDE.md and update ZOHO_REFRESH_TOKEN, or remove them and use Connect Zoho.")
+    return "To fix it, Disconnect and Connect Zoho again in the review app: a new code includes leave access."
+
+
+def days_off(from_date: datetime.date, to_date: datetime.date, tok: str) -> tuple[dict[str, str], str | None]:
+    """Your full days off in Zoho, {"YYYY-MM-DD": "leave" | "holiday"}, plus a note if they couldn't be read.
+
+    Never raises: the missed-day check works without them. Counts approved full-day leave only (a half day
+    or hour-based leave still leaves time to log) and full, non-optional holidays (an optional holiday
+    you take shows up as leave). Cached CATALOG_TTL: both APIs allow only 30 calls per 5 minutes.
+    """
+    key = (from_date, to_date)
+    hit = _days_off_cache.get(key)
+    if hit and time.time() - hit[0] < CATALOG_TTL:
+        return hit[1]
+    dates = {"from": from_date.strftime("%d-%b-%Y"), "to": to_date.strftime("%d-%b-%Y"), "dateFormat": "dd-MMM-yyyy"}
+    headers = {"Authorization": f"Zoho-oauthtoken {tok}"}
+    off: dict[str, str] = {}
+    try:
+        leave = requests.get(LEAVE_API, headers=headers, timeout=ZOHO_TIMEOUT, params={
+            **dates, "approvalStatus": '["APPROVED"]', "dataSelect": "MINE", "limit": 200}).json()
+        if not isinstance(leave.get("records"), dict):
+            raise _api_error("leave", leave)
+        for record in leave["records"].values():
+            if record.get("Unit") != "Days" or str(record.get("ApprovalStatus", "")).lower() != "approved":
+                continue
+            for day, info in (record.get("Days") or {}).items():
+                if float((info or {}).get("LeaveCount") or 0) >= 1 and _zoho_date(day):
+                    off[_zoho_date(day)] = "leave"
+
+        holidays = requests.get(HOLIDAYS_API, params=dates, headers=headers, timeout=ZOHO_TIMEOUT).json()
+        if not isinstance(holidays.get("data"), list):
+            raise _api_error("holidays", holidays)
+        for holiday in holidays["data"]:
+            if not holiday.get("isHalfday") and not holiday.get("isRestrictedHoliday") and _zoho_date(holiday.get("Date")):
+                off[_zoho_date(holiday["Date"])] = "holiday"
+        result = (off, None)
+    except (requests.RequestException, ValueError, TypeError, AttributeError, ZohoAPIError) as exc:
+        result = ({}, f"Leave and holidays not read from Zoho ({_redact(exc)[:NOTE_CHARS]}). {_leave_fix()}")
+    _days_off_cache[key] = (time.time(), result)
+    return result
+
+
 # ── Writes ─────────────────────────────────────────────────────────────────────
 
 def _post(endpoint: str, data: dict, tok: str) -> dict:
@@ -249,7 +418,7 @@ def _post(endpoint: str, data: dict, tok: str) -> dict:
 def _log_locally(work_date: datetime.date, what: str, when: str, description: str) -> None:
     try:
         ZOHO_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(ZOHO_LOG_FILE, "a") as f:
+        with open(ZOHO_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"{work_date.isoformat()} | {what} | {when} | {description}\n")
     except OSError:
         pass
@@ -258,7 +427,7 @@ def _log_locally(work_date: datetime.date, what: str, when: str, description: st
 def add_timelog(job_id: str, work_date: datetime.date, description: str, tok: str, *, hours: str,
                 project_id: str = "", billing: str = "Billable", label: str = "") -> dict:
     """Create an hours-mode time log; hours is 'HH:MM'."""
-    data = {"user": USER, "jobId": str(job_id), "workDate": work_date.isoformat(), "billingStatus": billing,
+    data = {"user": user(), "jobId": str(job_id), "workDate": work_date.isoformat(), "billingStatus": billing,
             "workItem": description, "hours": hours}
     if project_id:
         data["projectId"] = str(project_id)

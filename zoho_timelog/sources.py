@@ -1,6 +1,6 @@
 """Activity sources for one day. Nothing here decides projects; drafts.py does.
 
-    claude    ~/.timelog/DATE.jsonl written by hooks/timelog.sh     points (prompts)
+    claude    ~/.timelog/DATE.jsonl written by `timelog hook`      points (prompts)
     meetings  Outlook calendar via the claude.ai Microsoft 365       spans
               connector (headless `claude -p`, calendar read tool only)
     git       your commits in a repo, used for descriptions
@@ -10,19 +10,22 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
-from constants import (CLAUDE_MODEL, CLAUDE_TIMEOUT, ERROR_CHARS, MAX_COMMITS, MCP_LIST_TIMEOUT,
-                       MEETINGS_MODEL, MEETINGS_OTHER_TOOLS, MEETINGS_TIMEOUT, MEETINGS_TOOL, NOTE_CHARS,
-                       PROJECTS_FILE, TIMELOG_DIR)
+from .constants import (CLAUDE_MODEL, CLAUDE_TIMEOUT, ERROR_CHARS, MAX_COMMITS, MCP_LIST_TIMEOUT,
+                        MEETINGS_MODEL, MEETINGS_OTHER_TOOLS, MEETINGS_TIMEOUT, MEETINGS_TOOL, NOTE_CHARS,
+                        PROJECTS_FILE, TIMELOG_DIR)
+from .hook import clean_prompt
+from .oscompat import run
 
 # What a failed headless `claude -p` call can raise (see run_claude)
 CLAUDE_ERRORS = (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError)
 
 
 def load_mapping() -> dict:
-    return json.loads(PROJECTS_FILE.read_text()) if PROJECTS_FILE.exists() else {}
+    return json.loads(PROJECTS_FILE.read_text(encoding="utf-8")) if PROJECTS_FILE.exists() else {}
 
 
 def day_bounds(day: datetime.date) -> tuple[datetime.datetime, datetime.datetime]:
@@ -33,27 +36,15 @@ def day_bounds(day: datetime.date) -> tuple[datetime.datetime, datetime.datetime
 
 # ── Claude Code prompts ────────────────────────────────────────────────────────
 
-IDE_BLOCK = re.compile(r"<ide_[a-z_]+>.*?(</ide_[a-z_]+>|$)", re.S)  # $: cut off by the 200-char limit
-INJECTED  = ("<task-notification", "<system-reminder", "<local-command")
-
-
-def clean_prompt(prompt: str) -> str | None:
-    """What you typed, or None for messages Claude Code injected itself (same rules as the hook,
-    applied again here for lines captured before the hook filtered them)."""
-    text = IDE_BLOCK.sub("", prompt or "").strip()
-    if not text or text.startswith(INJECTED):
-        return None
-    return text
-
-
 def load_activity(day: datetime.date, base: Path = TIMELOG_DIR) -> list[dict]:
-    """Read a day's hook jsonl, skipping malformed lines and injected messages.
+    """Read a day's hook jsonl, skipping malformed lines and injected messages (the hook's own
+    clean_prompt, applied again for lines captured before the hook filtered them).
     Adds a parsed 'dt' to each record."""
     path = base / f"{day.isoformat()}.jsonl"
     if not path.exists():
         return []
     records = []
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             rec = json.loads(line)
             rec["dt"] = datetime.datetime.fromisoformat(rec["ts"])
@@ -71,14 +62,13 @@ def git_commits(path: str, day: datetime.date) -> list[dict]:
     """Your commits (any branch) in one repo on a day: [{"dt", "subject"}], oldest first."""
     if not path or not Path(path, ".git").exists():
         return []
-    author = subprocess.run(["git", "-C", path, "config", "user.email"],
-                            capture_output=True, text=True).stdout.strip()
+    author = run(["git", "-C", path, "config", "user.email"], capture_output=True, text=True).stdout.strip()
     cmd = ["git", "-C", path, "log", "--all", "--no-merges", "--format=%aI%x09%s",
            f"--since={day.isoformat()} 00:00", f"--until={day.isoformat()} 23:59:59"]
     if author:
         cmd += [f"--author={author}", "--regexp-ignore-case"]
     commits = []
-    for line in subprocess.run(cmd, capture_output=True, text=True).stdout.splitlines()[:MAX_COMMITS]:
+    for line in run(cmd, capture_output=True, text=True).stdout.splitlines()[:MAX_COMMITS]:
         ts, _, subject = line.partition("\t")
         try:
             commits.append({"dt": datetime.datetime.fromisoformat(ts), "subject": subject})
@@ -89,6 +79,23 @@ def git_commits(path: str, day: datetime.date) -> list[dict]:
 
 # ── Headless Claude ────────────────────────────────────────────────────────────
 
+def claude_cmd() -> list[str]:
+    """How to start Claude Code: its full path (FileNotFoundError if it isn't installed).
+
+    npm on Windows installs claude.cmd, a batch shim; arguments to it pass through cmd.exe, which
+    mangles the JSON schema, so the script it wraps is run with node directly when it can be found.
+    """
+    exe = shutil.which("claude")
+    if not exe:
+        raise FileNotFoundError("Claude Code (`claude`) isn't on PATH")
+    if exe.lower().endswith((".cmd", ".bat")):
+        script = Path(exe).parent / "node_modules" / "@anthropic-ai" / "claude-code" / "cli.js"
+        node = shutil.which("node")
+        if script.exists() and node:
+            return [node, str(script)]
+    return [exe]
+
+
 def run_claude(prompt: str, schema: dict, model: str = CLAUDE_MODEL, allowed_tools: str = "",
                timeout: int = CLAUDE_TIMEOUT, meta: bool = False, disallowed_tools=()):
     """One headless `claude -p` call returning schema'd JSON (and the raw result when meta=True).
@@ -97,15 +104,14 @@ def run_claude(prompt: str, schema: dict, model: str = CLAUDE_MODEL, allowed_too
     only those MCP tools are permitted (anything else is denied in -p mode). disallowed_tools
     (tool names or server prefixes) are left out of the context entirely, which saves tokens.
     """
-    cmd = ["claude", "-p", "--model", model, "--output-format", "json",
+    cmd = [*claude_cmd(), "-p", "--model", model, "--output-format", "json",
            "--json-schema", json.dumps(schema), "--tools", "", "--no-session-persistence"]
     cmd += ["--allowedTools", allowed_tools] if allowed_tools else ["--strict-mcp-config"]
     if disallowed_tools:
         cmd += ["--disallowedTools", *disallowed_tools]  # the prompt goes on stdin, so nothing follows it
     env = {**os.environ, "TIMELOG_DISABLE": "1"}  # don't record our own runs as activity
     TIMELOG_DIR.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                          timeout=timeout, env=env, cwd=TIMELOG_DIR)
+    proc = run(cmd, input=prompt, capture_output=True, text=True, timeout=timeout, env=env, cwd=TIMELOG_DIR)
     if proc.returncode != 0:
         raise RuntimeError(f"claude exited {proc.returncode}: {(proc.stderr or proc.stdout).strip()[:ERROR_CHARS]}")
     out = json.loads(proc.stdout)
@@ -130,8 +136,8 @@ def other_mcp_servers() -> list[str]:
     global _servers_cache
     if _servers_cache is None:
         try:
-            listing = subprocess.run(["claude", "mcp", "list"], capture_output=True, text=True,
-                                     timeout=MCP_LIST_TIMEOUT, cwd=TIMELOG_DIR).stdout
+            listing = run([*claude_cmd(), "mcp", "list"], capture_output=True, text=True,
+                          timeout=MCP_LIST_TIMEOUT, cwd=TIMELOG_DIR).stdout
         except (OSError, subprocess.SubprocessError):
             listing = ""
         _servers_cache = parse_mcp_list(listing)

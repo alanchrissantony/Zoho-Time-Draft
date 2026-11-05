@@ -1,0 +1,29 @@
+[project]
+name = "zoho-timelog"
+version = "0.1.0"
+description = "Draft Zoho People time logs from Claude Code activity and Outlook meetings; review them before they're sent."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv>=1.0",
+    "requests>=2.31",
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+timelog = "zoho_timelog.__main__:main"
+
+[project.gui-scripts]
+# Windows: same entry point without a console window, for scheduled tasks
+timelogw = "zoho_timelog.__main__:main"
+
+[dependency-groups]
+dev = ["httpx>=0.27"]   # the review app's route tests (starlette.testclient)
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["zoho_timelog"]
